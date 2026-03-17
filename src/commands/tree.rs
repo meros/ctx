@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::Args;
-use ignore::WalkBuilder;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::filter;
+use crate::walker;
 
 #[derive(Args)]
 pub struct TreeArgs {
@@ -27,26 +27,18 @@ pub struct TreeArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long)]
+    pub tokens: Option<usize>,
 }
 
 pub fn run(args: TreeArgs) -> Result<()> {
     let root = args.path.canonicalize().unwrap_or(args.path.clone());
     let mut entries: Vec<PathBuf> = Vec::new();
 
-    let walker = WalkBuilder::new(&root)
+    let walker = walker::build_walker(&root, !args.no_gitignore)
         .max_depth(Some(args.max_depth))
-        .git_ignore(!args.no_gitignore)
-        .git_global(!args.no_gitignore)
-        .hidden(false) // show dotfiles like .env.example
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            // Skip common noise directories even if not gitignored
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | "dist" | "build" | ".next" | "__pycache__" | "target"
-                | ".turbo" | ".cache" | ".parcel-cache"
-            )
-        })
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 
@@ -69,12 +61,22 @@ pub fn run(args: TreeArgs) -> Result<()> {
             })
             .collect();
         let output = serde_json::to_string_pretty(&json_entries)?;
+        let output = if let Some(max_tokens) = args.tokens {
+            crate::tokens::truncate_to_tokens(&output, max_tokens)
+        } else {
+            output
+        };
         let output = filter::maybe_filter(&output, &args.ask)?;
         print!("{}", output);
         return Ok(());
     }
 
     let output = format_tree(&root, &entries);
+    let output = if let Some(max_tokens) = args.tokens {
+        crate::tokens::truncate_to_tokens(&output, max_tokens)
+    } else {
+        output
+    };
     let output = filter::maybe_filter(&output, &args.ask)?;
     print!("{}", output);
     Ok(())
@@ -83,6 +85,7 @@ pub fn run(args: TreeArgs) -> Result<()> {
 fn format_tree(root: &Path, entries: &[PathBuf]) -> String {
     // Build a tree structure using BTreeMap for sorted output
     let mut tree: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    let mut dir_set: HashSet<PathBuf> = HashSet::new();
 
     for entry in entries {
         let rel = entry.strip_prefix(root).unwrap_or(entry);
@@ -90,6 +93,15 @@ fn format_tree(root: &Path, entries: &[PathBuf]) -> String {
             tree.entry(parent.to_path_buf())
                 .or_default()
                 .push(rel.to_path_buf());
+            // Track all ancestor paths as directories
+            let mut ancestor = parent.to_path_buf();
+            while !ancestor.as_os_str().is_empty() {
+                dir_set.insert(ancestor.clone());
+                ancestor = match ancestor.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => break,
+                };
+            }
         }
     }
 
@@ -104,7 +116,7 @@ fn format_tree(root: &Path, entries: &[PathBuf]) -> String {
         let mut sorted = children.clone();
         sorted.sort();
         sorted.dedup();
-        format_children(&mut output, &tree, &sorted, "", entries);
+        format_children(&mut output, &tree, &sorted, "", &dir_set);
     }
     output
 }
@@ -114,7 +126,7 @@ fn format_children(
     tree: &BTreeMap<PathBuf, Vec<PathBuf>>,
     children: &[PathBuf],
     prefix: &str,
-    all_entries: &[PathBuf],
+    dir_set: &HashSet<PathBuf>,
 ) {
     for (i, child) in children.iter().enumerate() {
         let is_last = i == children.len() - 1;
@@ -124,14 +136,10 @@ fn format_children(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let is_dir = tree.contains_key(child)
-            || all_entries.iter().any(|e| {
-                let rel = e.strip_prefix(e.ancestors().last().unwrap_or(e)).unwrap_or(e);
-                rel.starts_with(child) && rel != child
-            });
+        let is_dir = tree.contains_key(child) || dir_set.contains(child);
 
         if is_dir {
-            output.push_str(&format!("{}{}{}/ \n", prefix, connector, name));
+            output.push_str(&format!("{}{}{}/\n", prefix, connector, name));
         } else {
             output.push_str(&format!("{}{}{}\n", prefix, connector, name));
         }
@@ -142,7 +150,7 @@ fn format_children(
             let mut sorted = sub_children.clone();
             sorted.sort();
             sorted.dedup();
-            format_children(output, tree, &sorted, &new_prefix, all_entries);
+            format_children(output, tree, &sorted, &new_prefix, dir_set);
         }
     }
 }

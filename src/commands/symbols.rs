@@ -1,11 +1,11 @@
 use anyhow::Result;
 use clap::Args;
-use ignore::WalkBuilder;
 use std::fs;
 use std::path::PathBuf;
 
 use crate::filter;
 use crate::ts;
+use crate::walker;
 
 #[derive(Args)]
 pub struct SymbolsArgs {
@@ -27,11 +27,16 @@ pub struct SymbolsArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long)]
+    pub tokens: Option<usize>,
 }
 
 pub fn run(args: SymbolsArgs) -> Result<()> {
     let files = collect_files(&args)?;
     let mut all_symbols: Vec<(String, ts::SymbolInfo)> = Vec::new();
+    let mut parser = tree_sitter::Parser::new();
 
     for file in &files {
         let lang = match ts::Lang::from_path(file) {
@@ -44,7 +49,7 @@ pub fn run(args: SymbolsArgs) -> Result<()> {
             Err(_) => continue,
         };
 
-        let tree = match ts::parse(&content, lang) {
+        let tree = match ts::parse_with(&mut parser, &content, lang) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -101,6 +106,11 @@ pub fn run(args: SymbolsArgs) -> Result<()> {
         }
     };
 
+    let output = if let Some(max_tokens) = args.tokens {
+        crate::tokens::truncate_to_tokens(&output, max_tokens)
+    } else {
+        output
+    };
     let output = filter::maybe_filter(&output, &args.ask)?;
     print!("{}", output);
     Ok(())
@@ -112,16 +122,7 @@ fn collect_files(args: &SymbolsArgs) -> Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    let walker = WalkBuilder::new(&args.path)
-        .git_ignore(true)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | "dist" | "build" | ".next" | "__pycache__" | "target"
-            )
-        })
-        .build();
+    let walker = walker::build_walker(&args.path, true).build();
 
     for entry in walker.flatten() {
         let path = entry.path().to_path_buf();

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Args;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::filter;
 
@@ -18,6 +18,10 @@ pub struct OverviewArgs {
     /// Filter output through Claude with a question
     #[arg(long)]
     pub ask: Option<String>,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long)]
+    pub tokens: Option<usize>,
 }
 
 pub fn run(args: OverviewArgs) -> Result<()> {
@@ -42,12 +46,14 @@ pub fn run(args: OverviewArgs) -> Result<()> {
         "default.nix",
     ];
 
+    let mut config_contents: Vec<(&str, String)> = Vec::new();
     for config in &config_files {
         let path = root.join(config);
         if path.exists() {
             if let Ok(content) = fs::read_to_string(&path) {
                 let preview = truncate_lines(&content, 30);
                 output.push_str(&format!("## {}\n```\n{}\n```\n\n", config, preview));
+                config_contents.push((config, content));
             }
         }
     }
@@ -90,7 +96,7 @@ pub fn run(args: OverviewArgs) -> Result<()> {
     output.push_str("```\n\n");
 
     // 5. Key structural hints
-    let workspace_hints = detect_workspaces(&root);
+    let workspace_hints = detect_workspaces(&root, &config_contents);
     if !workspace_hints.is_empty() {
         output.push_str("## Workspaces/Packages\n");
         for hint in &workspace_hints {
@@ -99,6 +105,11 @@ pub fn run(args: OverviewArgs) -> Result<()> {
         output.push('\n');
     }
 
+    let output = if let Some(max_tokens) = args.tokens {
+        crate::tokens::truncate_to_tokens(&output, max_tokens)
+    } else {
+        output
+    };
     let output = filter::maybe_filter(&output, &args.ask)?;
     print!("{}", output);
     Ok(())
@@ -114,27 +125,18 @@ fn truncate_lines(content: &str, max_lines: usize) -> String {
     }
 }
 
-fn build_compact_tree(root: &PathBuf, max_depth: usize) -> Result<String> {
-    use ignore::WalkBuilder;
+fn build_compact_tree(root: &Path, max_depth: usize) -> Result<String> {
+    use crate::walker;
 
-    let walker = WalkBuilder::new(root)
+    let walker = walker::build_walker(root, true)
         .max_depth(Some(max_depth))
-        .git_ignore(true)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | "dist" | "build" | ".next" | "__pycache__" | "target"
-                | ".turbo" | ".cache"
-            )
-        })
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 
     let mut output = String::new();
     for entry in walker.flatten() {
         let path = entry.path();
-        if path == root.as_path() {
+        if path == root {
             continue;
         }
         let rel = path.strip_prefix(root).unwrap_or(path);
@@ -150,20 +152,34 @@ fn build_compact_tree(root: &PathBuf, max_depth: usize) -> Result<String> {
     Ok(output)
 }
 
-fn detect_workspaces(root: &PathBuf) -> Vec<String> {
+fn detect_workspaces(root: &Path, config_contents: &[(&str, String)]) -> Vec<String> {
     let mut hints = Vec::new();
 
-    // Check package.json for workspaces
-    let pkg_path = root.join("package.json");
-    if pkg_path.exists() {
-        if let Ok(content) = fs::read_to_string(&pkg_path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(workspaces) = json.get("workspaces") {
-                    if let Some(arr) = workspaces.as_array() {
-                        for ws in arr {
-                            if let Some(s) = ws.as_str() {
-                                hints.push(s.to_string());
-                            }
+    // Check package.json for workspaces (use cached content if available)
+    let pkg_content = config_contents
+        .iter()
+        .find(|(name, _)| *name == "package.json")
+        .map(|(_, c)| c.as_str());
+    let pkg_content_owned;
+    let pkg_content = match pkg_content {
+        Some(c) => Some(c),
+        None => {
+            let pkg_path = root.join("package.json");
+            if pkg_path.exists() {
+                pkg_content_owned = fs::read_to_string(&pkg_path).ok();
+                pkg_content_owned.as_deref()
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(content) = pkg_content {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(workspaces) = json.get("workspaces") {
+                if let Some(arr) = workspaces.as_array() {
+                    for ws in arr {
+                        if let Some(s) = ws.as_str() {
+                            hints.push(s.to_string());
                         }
                     }
                 }
@@ -171,23 +187,37 @@ fn detect_workspaces(root: &PathBuf) -> Vec<String> {
         }
     }
 
-    // Check Cargo.toml for workspace members
-    let cargo_path = root.join("Cargo.toml");
-    if cargo_path.exists() {
-        if let Ok(content) = fs::read_to_string(&cargo_path) {
-            // Simple parse for [workspace] members
-            let mut in_workspace = false;
-            for line in content.lines() {
-                if line.trim() == "[workspace]" {
-                    in_workspace = true;
-                } else if line.starts_with('[') && in_workspace {
-                    in_workspace = false;
-                }
-                if in_workspace && line.contains('"') {
-                    let member = line.trim().trim_matches(|c: char| c == '"' || c == ',' || c == ' ');
-                    if !member.is_empty() && !member.starts_with('[') && !member.starts_with("members") {
-                        hints.push(member.to_string());
-                    }
+    // Check Cargo.toml for workspace members (use cached content if available)
+    let cargo_content = config_contents
+        .iter()
+        .find(|(name, _)| *name == "Cargo.toml")
+        .map(|(_, c)| c.as_str());
+    let cargo_content_owned;
+    let cargo_content = match cargo_content {
+        Some(c) => Some(c),
+        None => {
+            let cargo_path = root.join("Cargo.toml");
+            if cargo_path.exists() {
+                cargo_content_owned = fs::read_to_string(&cargo_path).ok();
+                cargo_content_owned.as_deref()
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(content) = cargo_content {
+        // Simple parse for [workspace] members
+        let mut in_workspace = false;
+        for line in content.lines() {
+            if line.trim() == "[workspace]" {
+                in_workspace = true;
+            } else if line.starts_with('[') && in_workspace {
+                in_workspace = false;
+            }
+            if in_workspace && line.contains('"') {
+                let member = line.trim().trim_matches(|c: char| c == '"' || c == ',' || c == ' ');
+                if !member.is_empty() && !member.starts_with('[') && !member.starts_with("members") {
+                    hints.push(member.to_string());
                 }
             }
         }

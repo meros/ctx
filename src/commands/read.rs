@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::filter;
+use crate::ts;
 
 #[derive(Args)]
 pub struct ReadArgs {
@@ -19,6 +20,10 @@ pub struct ReadArgs {
     #[arg(long = "match")]
     pub match_pattern: Option<String>,
 
+    /// Show only signatures/types/imports (tree-sitter skeleton, ~5-50x fewer tokens)
+    #[arg(long)]
+    pub skeleton: bool,
+
     /// Filter output through Claude with a question
     #[arg(long)]
     pub ask: Option<String>,
@@ -26,6 +31,10 @@ pub struct ReadArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long)]
+    pub tokens: Option<usize>,
 }
 
 pub fn run(args: ReadArgs) -> Result<()> {
@@ -36,13 +45,21 @@ pub fn run(args: ReadArgs) -> Result<()> {
         let content = fs::read_to_string(file)
             .with_context(|| format!("Failed to read: {}", file.display()))?;
 
+        let content = if args.skeleton {
+            if let Some(lang) = ts::Lang::from_path(file) {
+                ts::extract_skeleton(&content, lang)
+            } else {
+                content
+            }
+        } else {
+            content
+        };
+
         let lines: Vec<&str> = content.lines().collect();
         let start = start_line.unwrap_or(1).saturating_sub(1);
         let end = end_line.unwrap_or(lines.len()).min(lines.len());
 
-        if args.files.len() > 1 {
-            output.push_str(&format!("=== {} (lines {}-{} of {}) ===\n", file.display(), start + 1, end, lines.len()));
-        }
+        output.push_str(&format!("=== {} (lines {}-{} of {}) ===\n", file.display(), start + 1, end, lines.len()));
 
         for (i, line) in lines[start..end].iter().enumerate() {
             let line_num = start + i + 1;
@@ -67,9 +84,19 @@ pub fn run(args: ReadArgs) -> Result<()> {
             "content": output,
         });
         let output = serde_json::to_string_pretty(&json)?;
+        let output = if let Some(max_tokens) = args.tokens {
+            crate::tokens::truncate_to_tokens(&output, max_tokens)
+        } else {
+            output
+        };
         let output = filter::maybe_filter(&output, &args.ask)?;
         print!("{}", output);
     } else {
+        let output = if let Some(max_tokens) = args.tokens {
+            crate::tokens::truncate_to_tokens(&output, max_tokens)
+        } else {
+            output
+        };
         let output = filter::maybe_filter(&output, &args.ask)?;
         print!("{}", output);
     }

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::Args;
-use ignore::WalkBuilder;
-use regex::Regex;
+use globset::Glob;
 use std::path::PathBuf;
 
 use crate::filter;
+use crate::walker;
 
 #[derive(Args)]
 pub struct FindArgs {
@@ -37,21 +37,9 @@ pub struct FindArgs {
 }
 
 pub fn run(args: FindArgs) -> Result<()> {
-    let matcher = glob_to_regex(&args.pattern);
+    let glob = Glob::new(&args.pattern)?.compile_matcher();
 
-    let walker = WalkBuilder::new(&args.path)
-        .git_ignore(!args.no_gitignore)
-        .git_global(!args.no_gitignore)
-        .hidden(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | "dist" | "build" | ".next" | "__pycache__" | "target"
-                    | ".turbo" | ".cache"
-            )
-        })
-        .build();
+    let walker = walker::build_walker(&args.path, !args.no_gitignore).build();
 
     let mut results: Vec<String> = Vec::new();
 
@@ -68,7 +56,7 @@ pub fn run(args: FindArgs) -> Result<()> {
             None => continue,
         };
 
-        if !matcher.is_match(&name) {
+        if !glob.is_match(name.as_ref()) {
             continue;
         }
 
@@ -94,23 +82,4 @@ pub fn run(args: FindArgs) -> Result<()> {
     let output = filter::maybe_filter(&output, &args.ask)?;
     print!("{}", output);
     Ok(())
-}
-
-/// Convert a simple glob pattern to a regex.
-/// Supports: *, ?, and character classes.
-fn glob_to_regex(pattern: &str) -> Regex {
-    let mut regex = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '.' | '+' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '$' | '|' | '\\' => {
-                regex.push('\\');
-                regex.push(ch);
-            }
-            _ => regex.push(ch),
-        }
-    }
-    regex.push('$');
-    Regex::new(&regex).unwrap_or_else(|_| Regex::new(".*").unwrap())
 }

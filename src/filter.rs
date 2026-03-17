@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -49,9 +50,10 @@ pub fn ask_claude(input: &str, question: &str) -> Result<String> {
 }
 
 /// If `ask` is Some, filters the output through Claude. Otherwise returns as-is.
-pub fn maybe_filter(output: &str, ask: &Option<String>) -> Result<String> {
+/// Returns Cow::Borrowed when no filtering is needed to avoid cloning.
+pub fn maybe_filter<'a>(output: &'a str, ask: &Option<String>) -> Result<Cow<'a, str>> {
     match ask {
-        Some(question) => ask_claude(output, question),
-        None => Ok(output.to_string()),
+        Some(question) => Ok(Cow::Owned(ask_claude(output, question)?)),
+        None => Ok(Cow::Borrowed(output)),
     }
 }

@@ -5,7 +5,6 @@ pub mod read;
 pub mod symbols;
 pub mod overview;
 pub mod deps;
-pub mod reference;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -16,29 +15,42 @@ use clap::{Parser, Subcommand};
 /// reducing tool calls and context window usage. All operations
 /// are read-only and safe to run at any time.
 ///
-/// USAGE FOR LLMs:
-///   - Use `ctx overview` first to understand a project
-///   - Use `ctx grep` to find symbols/patterns across the codebase
-///   - Use `ctx find` to locate files by name pattern
-///   - Use `ctx read` to read multiple files in one call
-///   - Use `ctx tree` to see directory structure
-///   - Use `ctx symbols` to list exports/types/functions
-///   - Use `ctx deps` to trace import chains
-///   - Append `--ask "question"` to ANY command to filter output
-///     through Claude, getting only relevant parts back
-///   - Use `--json` on most commands for structured output
+/// DECISION GUIDE — which command do I need?
+///
+///   New/unfamiliar project?    → ctx overview .
+///   Know a file name?          → ctx find '*name*'
+///   Know a symbol/pattern?     → ctx grep 'symbol' (add --fn for full function body)
+///   Need file contents?        → ctx read file1 file2
+///   Need a module's API?       → ctx symbols path/
+///   Need dependency chain?     → ctx deps file
+///   Need directory layout?     → ctx tree path/ -d 3
+///
+/// GLOBAL OPTIONS (available on most commands):
+///
+///   --ask "question"   Filter output through Claude (smart extraction)
+///   --tokens N         Truncate output to ~N estimated tokens
+///   --json             Machine-readable JSON output
+///   --no-gitignore     Include gitignored files
 #[derive(Parser)]
 #[command(name = "ctx", version, about, long_about)]
-#[command(after_help = "QUICK REFERENCE (for LLMs):
-  ctx overview .                    Project structure + README + key files
-  ctx tree src/ -d 3               Directory tree, max depth 3
-  ctx find '*.graphql'             Find files matching glob pattern
-  ctx grep 'fetchUser' --type ts   Search for pattern in TypeScript files
-  ctx read src/a.ts src/b.ts       Read multiple files, concatenated
-  ctx symbols src/models/           List all exports/types/interfaces
-  ctx deps src/index.ts            Show import dependency tree
+#[command(after_help = "EXAMPLES:
+  ctx overview .                               Understand a project quickly
+  ctx tree src/ -d 3                           Directory tree, max depth 3
+  ctx find '*.graphql'                         Find files matching glob pattern
+  ctx grep 'fetchUser' --type ts               Search TypeScript files for pattern
+  ctx grep 'fetchUser' --fn --no-tests         Show full function, skip test files
   ctx grep 'TODO' --ask 'which are security-related?'
-                                    LLM-filtered grep results")]
+                                               LLM-filtered grep results
+  ctx read src/a.ts src/b.ts                   Read multiple files, concatenated
+  ctx read src/a.ts --lines 10-50              Read specific line range
+  ctx symbols src/models/                      List all exports/types/interfaces
+  ctx deps src/index.ts                        Show import dependency tree
+
+TYPICAL WORKFLOW:
+  1. ctx overview .                  Get the lay of the land
+  2. ctx grep 'relevantSymbol' --fn  Find and read the code you need
+  3. ctx deps src/target.ts          Understand what it touches
+  4. ctx read src/a.ts src/b.ts      Read related files in one call")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -53,6 +65,10 @@ pub enum Command {
     ///
     /// WHEN TO USE: Understanding project layout, finding where code lives.
     /// TYPICAL FOLLOW-UP: `ctx read` or `ctx overview` on interesting paths.
+    ///
+    /// EXAMPLES:
+    ///   ctx tree src/ -d 3          Show src/ tree, max 3 levels deep
+    ///   ctx tree . -d 2 --json      Machine-readable directory structure
     Tree(tree::TreeArgs),
 
     /// Find files by name/glob pattern.
@@ -61,7 +77,11 @@ pub enum Command {
     /// modification time (newest first). Supports glob patterns.
     ///
     /// WHEN TO USE: Locating files by name when you know partial names.
-    /// EXAMPLE: `ctx find '*Resolver*' --type ts` finds all resolver files.
+    ///
+    /// EXAMPLES:
+    ///   ctx find '*.graphql'            All GraphQL schema files
+    ///   ctx find '*Resolver*' --type ts  TypeScript resolver files
+    ///   ctx find 'Dockerfile*'          All Dockerfiles
     Find(find::FindArgs),
 
     /// Search file contents for a pattern (regex).
@@ -69,10 +89,17 @@ pub enum Command {
     /// Shells out to ripgrep for speed. Returns matches with context.
     /// Use --type to filter by file extension.
     /// Use --fn to show the full enclosing function (replaces grep→read workflow).
+    /// Use --no-tests to exclude test files from results.
     /// Use -e N to show N lines of expanded context around each match.
     ///
     /// WHEN TO USE: Finding where symbols are defined/used, reading specific methods.
-    /// EXAMPLE: `ctx grep 'findPublicHomes' --fn --type ts` shows the full method.
+    ///
+    /// EXAMPLES:
+    ///   ctx grep 'fetchUser' --type ts          Find all references in TS files
+    ///   ctx grep 'fetchUser' --fn --no-tests    Show full function, skip tests
+    ///   ctx grep 'TODO' -e 5                    TODOs with 5 lines of context
+    ///   ctx grep 'dbConnect' --ask 'which handle errors?'
+    ///                                           LLM-filtered results
     Grep(grep::GrepArgs),
 
     /// Read one or more files, concatenated with headers.
@@ -82,7 +109,10 @@ pub enum Command {
     /// Can read many files in a single invocation.
     ///
     /// WHEN TO USE: Reading file contents. Replaces multiple Read tool calls.
-    /// EXAMPLE: `ctx read src/a.ts src/b.ts --lines 1-50`
+    ///
+    /// EXAMPLES:
+    ///   ctx read src/a.ts src/b.ts        Read two files in one call
+    ///   ctx read src/a.ts --lines 10-50   Read specific line range
     Read(read::ReadArgs),
 
     /// List exported symbols (functions, types, interfaces, classes).
@@ -91,7 +121,10 @@ pub enum Command {
     /// falls back to regex patterns. Groups by symbol kind.
     ///
     /// WHEN TO USE: Understanding a module's public API without reading full source.
-    /// EXAMPLE: `ctx symbols src/models/` lists all exports in that directory.
+    ///
+    /// EXAMPLES:
+    ///   ctx symbols src/models/                 All exports in directory
+    ///   ctx symbols src/ --type rs --kind fn    Only Rust functions
     Symbols(symbols::SymbolsArgs),
 
     /// Quick project overview: structure + README + key files.
@@ -100,6 +133,11 @@ pub enum Command {
     /// a single output. The fastest way to understand a new project.
     ///
     /// WHEN TO USE: First command when exploring an unfamiliar project.
+    /// This should almost always be your first ctx command.
+    ///
+    /// EXAMPLES:
+    ///   ctx overview .                  Overview of current project
+    ///   ctx overview packages/api/      Overview of a subpackage
     Overview(overview::OverviewArgs),
 
     /// Show import/dependency tree for a file.
@@ -107,15 +145,12 @@ pub enum Command {
     /// Traces import statements to show what a file depends on.
     /// Helps understand coupling and find related code.
     ///
-    /// WHEN TO USE: Understanding what code a file touches.
-    Deps(deps::DepsArgs),
-
-    /// Print compact LLM-optimized reference for all commands.
+    /// WHEN TO USE: Understanding what code a file touches, tracing coupling.
     ///
-    /// Outputs a minimal reference card designed to be included
-    /// in an LLM's system prompt or context window.
-    #[command(name = "llm-reference")]
-    LlmReference,
+    /// EXAMPLES:
+    ///   ctx deps src/index.ts           Show what index.ts imports
+    ///   ctx deps src/api/router.ts      Trace API router dependencies
+    Deps(deps::DepsArgs),
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -127,45 +162,5 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Symbols(args) => symbols::run(args),
         Command::Overview(args) => overview::run(args),
         Command::Deps(args) => deps::run(args),
-        Command::LlmReference => {
-            print!("{}", LLM_REFERENCE);
-            Ok(())
-        }
     }
 }
-
-const LLM_REFERENCE: &str = r#"# ctx — Context Gatherer CLI Reference
-
-Read-only codebase exploration tool. All commands are safe. Use `--ask "Q"` on any command to filter output through Claude.
-
-## Commands
-
-| Command | Purpose | Example |
-|---------|---------|---------|
-| overview [path] | Project structure + README + key config | `ctx overview .` |
-| tree [path] [-d N] | Directory tree (respects .gitignore) | `ctx tree src/ -d 3` |
-| find <glob> [--type ext] | Find files by name pattern | `ctx find '*Model*' --type ts` |
-| grep <pattern> [path] [--type ext] [-C N] | Search contents (regex) | `ctx grep 'fetchUser' --type ts` |
-| grep <pattern> --fn | Search + show full enclosing function | `ctx grep 'fetchUser' --fn` |
-| grep <pattern> -e 80 | Search + show N lines of context | `ctx grep 'fetchUser' -e 80` |
-| read <files...> [--lines N-M] | Read multiple files | `ctx read a.ts b.ts --lines 1-50` |
-| symbols <path> [--kind fn\|type\|class] | List exports/types/functions | `ctx symbols src/models/` |
-| deps <file> | Import dependency tree | `ctx deps src/index.ts` |
-
-## Global Options
-
-| Option | Effect |
-|--------|--------|
-| --ask "question" | Filter output through Claude (smart extraction) |
-| --json | Machine-readable JSON output |
-| --no-gitignore | Include gitignored files |
-
-## Decision Guide
-
-- New project? → `ctx overview .`
-- Know the name? → `ctx find '*name*'`
-- Know a symbol? → `ctx grep 'symbol'` (add `--fn` to see full function body)
-- Need file contents? → `ctx read file1 file2`
-- Need API surface? → `ctx symbols path/`
-- Need dependency chain? → `ctx deps file`
-"#;

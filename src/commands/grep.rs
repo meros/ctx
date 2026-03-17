@@ -1,16 +1,15 @@
 use anyhow::Result;
 use clap::Args;
-use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
-use ignore::WalkBuilder;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::filter;
 use crate::ts;
+use crate::walker;
 
 #[derive(Args)]
 pub struct GrepArgs {
@@ -59,6 +58,10 @@ pub struct GrepArgs {
     #[arg(long = "no-tests")]
     pub no_tests: bool,
 
+    /// Include gitignored files
+    #[arg(long = "no-gitignore")]
+    pub no_gitignore: bool,
+
     /// Filter output through Claude with a question
     #[arg(long)]
     pub ask: Option<String>,
@@ -66,6 +69,10 @@ pub struct GrepArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long)]
+    pub tokens: Option<usize>,
 }
 
 pub fn run(args: GrepArgs) -> Result<()> {
@@ -76,8 +83,10 @@ pub fn run(args: GrepArgs) -> Result<()> {
     };
 
     // Collect matching files and line numbers
-    let mut file_matches: BTreeMap<PathBuf, Vec<(u64, String)>> = BTreeMap::new();
+    // Cache file content alongside matches to avoid double-reads in format functions
+    let mut file_matches: FileMatches = BTreeMap::new();
     let files = collect_search_files(&args)?;
+    let needs_content = !args.files_only && !args.count;
 
     let mut searcher = Searcher::new();
     for file_path in &files {
@@ -94,7 +103,12 @@ pub fn run(args: GrepArgs) -> Result<()> {
             }),
         );
         if !matches.is_empty() {
-            file_matches.insert(file_path.clone(), matches);
+            let content = if needs_content {
+                fs::read_to_string(file_path).ok()
+            } else {
+                None
+            };
+            file_matches.insert(file_path.clone(), (matches, content));
         }
     }
 
@@ -111,9 +125,14 @@ pub fn run(args: GrepArgs) -> Result<()> {
     } else if args.expand_fn || args.expand.is_some() {
         format_expanded(&file_matches, &args)?
     } else {
-        format_context(&file_matches, &args, &matcher)?
+        format_context(&file_matches, &args)?
     };
 
+    let output = if let Some(max_tokens) = args.tokens {
+        crate::tokens::truncate_to_tokens(&output, max_tokens)
+    } else {
+        output
+    };
     let output = filter::maybe_filter(&output, &args.ask)?;
     print!("{}", output);
     Ok(())
@@ -125,18 +144,7 @@ fn collect_search_files(args: &GrepArgs) -> Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    let walker = WalkBuilder::new(&args.path)
-        .git_ignore(true)
-        .hidden(false)
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                "node_modules" | ".git" | "dist" | "build" | ".next" | "__pycache__" | "target"
-                    | ".turbo" | ".cache"
-            )
-        })
-        .build();
+    let walker = walker::build_walker(&args.path, !args.no_gitignore).build();
 
     for entry in walker.flatten() {
         let path = entry.path().to_path_buf();
@@ -150,10 +158,8 @@ fn collect_search_files(args: &GrepArgs) -> Result<Vec<PathBuf>> {
             }
         }
 
-        if args.no_tests {
-            if is_test_file(&path) {
-                continue;
-            }
+        if args.no_tests && is_test_file(&path) {
+            continue;
         }
 
         files.push(path);
@@ -174,7 +180,9 @@ fn is_test_file(path: &Path) -> bool {
         || name.contains(".mocha.")
 }
 
-fn format_files_only(matches: &BTreeMap<PathBuf, Vec<(u64, String)>>) -> String {
+type FileMatches = BTreeMap<PathBuf, (Vec<(u64, String)>, Option<String>)>;
+
+fn format_files_only(matches: &FileMatches) -> String {
     matches
         .keys()
         .map(|p| p.to_string_lossy().to_string())
@@ -183,27 +191,26 @@ fn format_files_only(matches: &BTreeMap<PathBuf, Vec<(u64, String)>>) -> String 
         + "\n"
 }
 
-fn format_count(matches: &BTreeMap<PathBuf, Vec<(u64, String)>>) -> String {
+fn format_count(matches: &FileMatches) -> String {
     matches
         .iter()
-        .map(|(p, m)| format!("{}:{}", p.display(), m.len()))
+        .map(|(p, (m, _))| format!("{}:{}", p.display(), m.len()))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
 }
 
 fn format_context(
-    matches: &BTreeMap<PathBuf, Vec<(u64, String)>>,
+    matches: &FileMatches,
     args: &GrepArgs,
-    matcher: &RegexMatcher,
 ) -> Result<String> {
     let mut output = String::new();
     let ctx = args.context_lines;
 
-    for (file_path, file_matches) in matches {
-        let content = match fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
+    for (file_path, (file_matches, cached_content)) in matches {
+        let content = match cached_content {
+            Some(c) => c.as_str(),
+            None => continue,
         };
         let lines: Vec<&str> = content.lines().collect();
 
@@ -214,36 +221,36 @@ fn format_context(
             let start = ln.saturating_sub(ctx + 1);
             let end = (ln + ctx).min(lines.len());
 
-            for i in start..end {
-                let marker = if i + 1 == ln { ">" } else { " " };
-                output.push_str(&format!("{}{:4} {}\n", marker, i + 1, lines[i]));
+            for (i, line) in lines[start..end].iter().enumerate() {
+                let line_idx = start + i + 1;
+                let marker = if line_idx == ln { ">" } else { " " };
+                output.push_str(&format!("{}{:4} {}\n", marker, line_idx, line));
             }
             output.push_str("--\n");
         }
         output.push('\n');
     }
 
-    // Suppress unused variable warning
-    let _ = matcher;
     Ok(output)
 }
 
 fn format_expanded(
-    matches: &BTreeMap<PathBuf, Vec<(u64, String)>>,
+    matches: &FileMatches,
     args: &GrepArgs,
 ) -> Result<String> {
     let mut result = String::new();
+    let mut parser = tree_sitter::Parser::new();
 
-    for (file_path, file_matches) in matches {
-        let content = match fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
+    for (file_path, (file_matches, cached_content)) in matches {
+        let content = match cached_content {
+            Some(c) => c.as_str(),
+            None => continue,
         };
         let lines: Vec<&str> = content.lines().collect();
 
-        // Parse with tree-sitter if using --fn
+        // Parse with tree-sitter if using --fn (reuse parser across files)
         let tree = if args.expand_fn {
-            ts::Lang::from_path(file_path).and_then(|lang| ts::parse(&content, lang).ok())
+            ts::Lang::from_path(file_path).and_then(|lang| ts::parse_with(&mut parser, content, lang).ok())
         } else {
             None
         };
@@ -257,7 +264,7 @@ fn format_expanded(
 
             if args.expand_fn {
                 let (start, end) = if let (Some(ref tree), Some(lang)) = (&tree, lang) {
-                    ts::find_enclosing_function(tree, &content, match_line - 1, lang)
+                    ts::find_enclosing_function(tree, content, match_line - 1, lang)
                         .unwrap_or_else(|| {
                             let half = 20;
                             (

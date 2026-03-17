@@ -27,6 +27,14 @@ pub struct DepsArgs {
     /// Filter output through Claude with a question
     #[arg(long)]
     pub ask: Option<String>,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long)]
+    pub tokens: Option<usize>,
 }
 
 pub fn run(args: DepsArgs) -> Result<()> {
@@ -39,6 +47,11 @@ pub fn run(args: DepsArgs) -> Result<()> {
     output.push_str(&format!("Dependencies for: {}\n\n", args.file.display()));
     trace_deps(&file, 0, args.max_depth, &mut visited, &mut output, &args)?;
 
+    let output = if let Some(max_tokens) = args.tokens {
+        crate::tokens::truncate_to_tokens(&output, max_tokens)
+    } else {
+        output
+    };
     let output = filter::maybe_filter(&output, &args.ask)?;
     print!("{}", output);
     Ok(())
@@ -71,17 +84,24 @@ fn trace_deps(
     let imports = ts::extract_imports(&tree, &content, lang);
     let indent = "  ".repeat(depth);
 
-    for import in &imports {
+    // Filter imports based on args
+    let filtered: Vec<_> = imports.iter().filter(|import| {
         let is_local = import.path.starts_with('.') || import.path.starts_with('/');
-
         if args.external_only && is_local {
-            continue;
+            return false;
         }
         if args.local_only && !is_local {
-            continue;
+            return false;
         }
+        true
+    }).collect();
 
-        output.push_str(&format!("{}├── {} ({})\n", indent, import.path, import.kind));
+    for (i, import) in filtered.iter().enumerate() {
+        let is_last = i == filtered.len() - 1;
+        let connector = if is_last { "└──" } else { "├──" };
+        let is_local = import.path.starts_with('.') || import.path.starts_with('/');
+
+        output.push_str(&format!("{}{} {} ({}, line {})\n", indent, connector, import.path, import.kind, import.line + 1));
 
         // Recursively trace local imports
         if is_local && depth < max_depth {

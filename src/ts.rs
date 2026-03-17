@@ -54,8 +54,6 @@ impl Lang {
             ],
             Lang::Rust => &[
                 "function_item",
-                "impl_item",
-                "trait_item",
             ],
             Lang::Python => &[
                 "function_definition",
@@ -83,36 +81,17 @@ impl Lang {
         }
     }
 
-    /// Node kinds that represent exported/public symbols.
-    fn exported_symbol_kinds(self) -> &'static [&'static str] {
-        match self {
-            Lang::TypeScript | Lang::Tsx | Lang::JavaScript => &[
-                "export_statement",
-            ],
-            Lang::Rust => &[
-                "function_item",
-                "struct_item",
-                "enum_item",
-                "trait_item",
-                "type_item",
-                "const_item",
-                "static_item",
-                "impl_item",
-                "mod_item",
-            ],
-            Lang::Python => &[
-                "function_definition",
-                "class_definition",
-                "decorated_definition",
-                "assignment",
-            ],
-        }
-    }
 }
 
 /// Parse source code with tree-sitter.
 pub fn parse(source: &str, lang: Lang) -> Result<Tree> {
     let mut parser = Parser::new();
+    parse_with(&mut parser, source, lang)
+}
+
+/// Parse source code reusing an existing Parser instance.
+/// More efficient when parsing multiple files — avoids re-allocating the parser each time.
+pub fn parse_with(parser: &mut Parser, source: &str, lang: Lang) -> Result<Tree> {
     parser
         .set_language(&lang.tree_sitter_language())
         .context("Failed to set tree-sitter language")?;
@@ -627,11 +606,485 @@ fn is_top_level_or_class_method(node: Node) -> bool {
     }
 }
 
+/// Extract a skeleton view of source code — signatures, types, imports only.
+/// Replaces function/method bodies with `{ ... }` (or `...` for Python) to dramatically
+/// reduce tokens while preserving the module's API surface.
+pub fn extract_skeleton(source: &str, lang: Lang) -> String {
+    let tree = match parse(source, lang) {
+        Ok(t) => t,
+        Err(_) => return source.to_string(),
+    };
+
+    let root = tree.root_node();
+    let lines: Vec<&str> = source.lines().collect();
+    let mut output = String::new();
+
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        skeleton_node(child, source, &lines, lang, &mut output, 0);
+    }
+
+    // Remove trailing blank lines but keep final newline
+    let trimmed = output.trim_end();
+    if trimmed.is_empty() {
+        output
+    } else {
+        let mut result = trimmed.to_string();
+        result.push('\n');
+        result
+    }
+}
+
+/// Recursively emit skeleton for a node.
+/// `depth` is the nesting level for indentation context.
+fn skeleton_node(
+    node: Node,
+    source: &str,
+    lines: &[&str],
+    lang: Lang,
+    output: &mut String,
+    depth: usize,
+) {
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
+            skeleton_node_ts(node, source, lines, lang, output, depth);
+        }
+        Lang::Rust => {
+            skeleton_node_rust(node, source, lines, lang, output, depth);
+        }
+        Lang::Python => {
+            skeleton_node_python(node, source, lines, lang, output, depth);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn skeleton_node_ts(
+    node: Node,
+    source: &str,
+    lines: &[&str],
+    lang: Lang,
+    output: &mut String,
+    depth: usize,
+) {
+    let kind = node.kind();
+    let start_row = node.start_position().row;
+    let end_row = node_last_row(node);
+    match kind {
+        // Function-like: emit signature + { ... }
+        "function_declaration" | "generator_function_declaration" | "function_expression" => {
+            emit_signature_then_body_placeholder(node, source, lines, output, "{", "{ ... }");
+        }
+        "arrow_function" => {
+            // Arrow functions: find the => and body
+            emit_signature_then_body_placeholder(node, source, lines, output, "=>", "=> { ... }");
+        }
+        "method_definition" => {
+            emit_signature_then_body_placeholder(node, source, lines, output, "{", "{ ... }");
+        }
+        // Export: recurse into children to handle the inner declaration
+        "export_statement" => {
+            // Check if this is a simple re-export (has source) or export of a declaration
+            let has_declaration = node.named_child_count() > 0
+                && node.named_child(0).map(|c| matches!(c.kind(),
+                    "function_declaration" | "class_declaration" | "abstract_class_declaration"
+                    | "lexical_declaration" | "type_alias_declaration" | "interface_declaration"
+                    | "enum_declaration" | "generator_function_declaration"
+                )).unwrap_or(false);
+
+            if has_declaration {
+                let inner = node.named_child(0).unwrap();
+                let inner_start = inner.start_position().row;
+                if inner_start == start_row {
+                    // Same line: the full source line already contains "export",
+                    // so just skeleton the inner node (which uses line-based output)
+                    skeleton_node(inner, source, lines, lang, output, depth);
+                } else {
+                    // Different lines — emit export lines then recurse
+                    for line in &lines[start_row..inner_start] {
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    skeleton_node(inner, source, lines, lang, output, depth);
+                }
+            } else {
+                // Simple export (re-export, export clause, etc.) — emit as-is
+                emit_node_full(lines, start_row, end_row, output);
+            }
+        }
+        // Lexical declarations (const/let/var): check if value is an arrow function
+        "lexical_declaration" => {
+            // Check if any variable_declarator has an arrow_function value
+            let mut cursor = node.walk();
+            let has_arrow = node.children(&mut cursor).any(|c| {
+                c.kind() == "variable_declarator"
+                    && c.child_by_field_name("value")
+                        .map(|v| v.kind() == "arrow_function")
+                        .unwrap_or(false)
+            });
+
+            if has_arrow {
+                emit_signature_then_body_placeholder(node, source, lines, output, "=>", "=> { ... }");
+            } else {
+                emit_node_full(lines, start_row, end_row, output);
+            }
+        }
+        // Class: emit class line then skeleton of members
+        "class_declaration" | "abstract_class_declaration" => {
+            // Find the class_body child
+            if let Some(body) = find_child_by_kind(node, "class_body") {
+                // Emit everything from class start to body open brace
+                let body_start = body.start_position().row;
+                for line in &lines[start_row..=body_start] {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+                // Recurse into class body members
+                let mut cursor = body.walk();
+                for member in body.children(&mut cursor) {
+                    if member.is_named() {
+                        skeleton_node(member, source, lines, lang, output, depth + 1);
+                    }
+                }
+                // Close brace
+                let body_end = node_last_row(body);
+                output.push_str(lines[body_end]);
+                output.push('\n');
+            } else {
+                emit_node_full(lines, start_row, end_row, output);
+            }
+        }
+        // Types/interfaces/enums: keep fully (they're already compact API surface)
+        "type_alias_declaration" | "interface_declaration" | "enum_declaration" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Import statements: keep as-is
+        "import_statement" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Comments: keep
+        "comment" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Everything else at this level: emit as-is
+        _ => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn skeleton_node_rust(
+    node: Node,
+    source: &str,
+    lines: &[&str],
+    lang: Lang,
+    output: &mut String,
+    depth: usize,
+) {
+    let kind = node.kind();
+    let start_row = node.start_position().row;
+    let end_row = node_last_row(node);
+    match kind {
+        // fn items: signature + { ... }
+        "function_item" => {
+            emit_signature_then_body_placeholder(node, source, lines, output, "{", "{ ... }");
+        }
+        // impl blocks: impl line + skeleton of methods
+        "impl_item" => {
+            if let Some(body) = find_child_by_kind(node, "declaration_list") {
+                let body_start = body.start_position().row;
+                // Emit from impl start to opening brace
+                for line in &lines[start_row..=body_start] {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+                // Recurse into impl methods
+                let mut cursor = body.walk();
+                for member in body.children(&mut cursor) {
+                    if member.is_named() {
+                        skeleton_node(member, source, lines, lang, output, depth + 1);
+                    }
+                }
+                // Closing brace
+                let body_end = node_last_row(body);
+                output.push_str(lines[body_end]);
+                output.push('\n');
+            } else {
+                emit_node_full(lines, start_row, end_row, output);
+            }
+        }
+        // trait: keep fully (signatures are the API)
+        "trait_item" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // struct/enum: keep fully (fields are the API)
+        "struct_item" | "enum_item" | "type_item" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // use/mod/extern: keep as-is
+        "use_declaration" | "mod_item" | "extern_crate_declaration" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Attribute: keep (often #[derive(...)] etc.)
+        "attribute_item" | "inner_attribute_item" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Comments and doc comments
+        "line_comment" | "block_comment" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Macro invocations: keep as-is
+        "macro_invocation" | "macro_definition" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // const/static items: keep as-is
+        "const_item" | "static_item" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        _ => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn skeleton_node_python(
+    node: Node,
+    source: &str,
+    lines: &[&str],
+    lang: Lang,
+    output: &mut String,
+    depth: usize,
+) {
+    let kind = node.kind();
+    let start_row = node.start_position().row;
+    let end_row = node_last_row(node);
+    match kind {
+        "function_definition" => {
+            // Emit def line(s) + indented ...
+            emit_python_def_skeleton(node, lines, output);
+        }
+        "class_definition" => {
+            // Emit class line, then skeleton of methods
+            if let Some(body) = node.child_by_field_name("body") {
+                let body_start = body.start_position().row;
+                // Emit from class start to body start
+                for line in &lines[start_row..body_start] {
+                    output.push_str(line);
+                    output.push('\n');
+                }
+                // Recurse into class body members
+                let mut cursor = body.walk();
+                for member in body.children(&mut cursor) {
+                    if member.is_named() {
+                        skeleton_node(member, source, lines, lang, output, depth + 1);
+                    }
+                }
+            } else {
+                emit_node_full(lines, start_row, end_row, output);
+            }
+        }
+        "decorated_definition" => {
+            // Emit decorator lines, then recurse into the inner definition
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "decorator" {
+                    emit_node_full(lines, child.start_position().row, node_last_row(child), output);
+                } else if child.is_named() {
+                    skeleton_node(child, source, lines, lang, output, depth);
+                }
+            }
+        }
+        // Imports: keep as-is
+        "import_statement" | "import_from_statement" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        "comment" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        // Expression statements (module-level assignments, etc.)
+        "expression_statement" => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+        _ => {
+            emit_node_full(lines, start_row, end_row, output);
+        }
+    }
+}
+
+/// Get the inclusive last row of a node.
+/// Tree-sitter's end_position can point to column 0 of the next row (past the newline),
+/// so we adjust when that happens.
+fn node_last_row(node: Node) -> usize {
+    let end = node.end_position();
+    if end.column == 0 && end.row > node.start_position().row {
+        end.row - 1
+    } else {
+        end.row
+    }
+}
+
+/// Emit all lines of a node as-is.
+fn emit_node_full(lines: &[&str], start_row: usize, end_row: usize, output: &mut String) {
+    // end_row is inclusive — but callers may pass tree-sitter end_position().row
+    // which can point past the node when column is 0.
+    // We cap at lines.len()-1 to be safe.
+    let end = (end_row + 1).min(lines.len());
+    for line in &lines[start_row..end] {
+        output.push_str(line);
+        output.push('\n');
+    }
+}
+
+/// Emit a function/method signature up to the body delimiter, then a placeholder.
+/// For `{`-based languages, finds the opening brace and replaces the body with `{ ... }`.
+/// For `=>`, finds the arrow and replaces the body with `=> { ... }`.
+fn emit_signature_then_body_placeholder(
+    node: Node,
+    source: &str,
+    lines: &[&str],
+    output: &mut String,
+    delimiter: &str,
+    placeholder: &str,
+) {
+    let start_row = node.start_position().row;
+    let end_row = node_last_row(node);
+
+    // For arrow functions with delimiter "=>", find the arrow
+    if delimiter == "=>" {
+        // Find the "=>" in the node text
+        let node_text = node.utf8_text(source.as_bytes()).unwrap_or("");
+        if let Some(arrow_offset) = node_text.find("=>") {
+            let abs_byte = node.start_byte() + arrow_offset;
+            // Find which line the => is on
+            let arrow_line = source[..abs_byte].lines().count().saturating_sub(1);
+            // Emit lines from start up to the arrow line
+            for line in &lines[start_row..arrow_line] {
+                output.push_str(line);
+                output.push('\n');
+            }
+            // On the arrow line, emit up to and including '=>' then placeholder
+            let line_text = lines[arrow_line];
+            // Find => position within this line
+            if let Some(pos) = line_text.find("=>") {
+                output.push_str(&line_text[..pos]);
+                output.push_str(placeholder);
+                output.push('\n');
+            } else {
+                output.push_str(line_text);
+                output.push(' ');
+                output.push_str(placeholder);
+                output.push('\n');
+            }
+            return;
+        }
+    }
+
+    // For '{' delimiter: find the opening brace in the body
+    if delimiter == "{" {
+        // Find the body child (statement_block, block, etc.)
+        let body = find_body_child(node);
+        if let Some(body_node) = body {
+            let brace_row = body_node.start_position().row;
+            // Emit lines from start up to (but not including) the brace line
+            for line in &lines[start_row..brace_row] {
+                output.push_str(line);
+                output.push('\n');
+            }
+            // On the brace line, find the '{' and emit up to it + placeholder
+            let line_text = lines[brace_row];
+            if let Some(pos) = line_text.find('{') {
+                let before_brace = line_text[..pos].trim_end();
+                if before_brace.is_empty() && brace_row > start_row {
+                    // Brace is on its own line — append to previous line
+                    // Remove the last newline we added
+                    if output.ends_with('\n') {
+                        output.pop();
+                    }
+                    output.push_str(" { ... }\n");
+                } else {
+                    output.push_str(before_brace);
+                    if !before_brace.is_empty() {
+                        output.push(' ');
+                    }
+                    output.push_str("{ ... }\n");
+                }
+            } else {
+                output.push_str(line_text);
+                output.push('\n');
+            }
+            return;
+        }
+    }
+
+    // Fallback: emit full node
+    emit_node_full(lines, start_row, end_row, output);
+}
+
+/// Emit a Python function def as skeleton: `def name(params):` + `    ...`
+fn emit_python_def_skeleton(node: Node, lines: &[&str], output: &mut String) {
+    let start_row = node.start_position().row;
+
+    // Find the body child
+    let body = node.child_by_field_name("body");
+    if let Some(body_node) = body {
+        let body_start = body_node.start_position().row;
+        // Emit the def line(s) up to the body
+        for line in &lines[start_row..body_start] {
+            output.push_str(line);
+            output.push('\n');
+        }
+        // Add indented ...
+        let indent = get_indent(lines, body_start);
+        output.push_str(&indent);
+        output.push_str("...\n");
+    } else {
+        // No body found, emit as-is
+        let end_row = node_last_row(node);
+        emit_node_full(lines, start_row, end_row, output);
+    }
+}
+
+/// Get the indentation of a line.
+fn get_indent(lines: &[&str], row: usize) -> String {
+    if row < lines.len() {
+        let line = lines[row];
+        let trimmed = line.trim_start();
+        line[..line.len() - trimmed.len()].to_string()
+    } else {
+        "    ".to_string()
+    }
+}
+
+/// Find the body/block child of a node (the part we want to collapse).
+fn find_body_child(node: Node) -> Option<Node> {
+    // Try common body field names
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some(body);
+    }
+
+    // Look for statement_block, block, declaration_list children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "statement_block" | "block" | "declaration_list" | "field_declaration_list" => {
+                return Some(child);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Get the first line of a node's source text.
+/// Uses byte offset for O(1) lookup instead of iterating lines from the start.
 fn first_line(node: Node, source: &str) -> String {
-    let start = node.start_position();
-    source
+    let byte_start = node.start_byte();
+    let remaining = &source[byte_start..];
+    remaining
         .lines()
-        .nth(start.row)
+        .next()
         .unwrap_or("")
         .trim()
         .to_string()

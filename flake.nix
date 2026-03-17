@@ -15,7 +15,7 @@
           pname = "ctx";
           version = "0.1.0";
           src = ./.;
-          cargoHash = "sha256-LbryPVhWuDL2GpiWALiDqel8QoRZM6etZm6Ydzulap4=";
+          cargoHash = "sha256-ukm9i8ancpMqsnd1jPVsRjRkqi4uP8Eg4hUT+ITpPag=";
         };
 
         devShells.default = pkgs.mkShell {

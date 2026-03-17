@@ -171,11 +171,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "globset",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
- "regex",
  "serde",
  "serde_json",
  "tree-sitter",
