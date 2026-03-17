@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::filter;
 
+use super::CommonArgs;
+
 #[derive(Args)]
 pub struct OverviewArgs {
     /// Root directory to overview
@@ -14,17 +16,9 @@ pub struct OverviewArgs {
     /// Maximum depth for the tree
     #[arg(short = 'd', long = "depth", default_value = "3")]
     pub max_depth: usize,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Maximum output size in estimated tokens (truncates with notice)
-    #[arg(long)]
-    pub tokens: Option<usize>,
 }
 
-pub fn run(args: OverviewArgs) -> Result<()> {
+pub fn run(args: OverviewArgs, common: &CommonArgs) -> Result<()> {
     let root = args.path.canonicalize().unwrap_or(args.path.clone());
     let mut output = String::new();
 
@@ -91,7 +85,7 @@ pub fn run(args: OverviewArgs) -> Result<()> {
 
     // 4. Directory tree (compact)
     output.push_str("## Directory Structure\n```\n");
-    let tree_output = build_compact_tree(&root, args.max_depth)?;
+    let tree_output = build_compact_tree(&root, args.max_depth, common)?;
     output.push_str(&tree_output);
     output.push_str("```\n\n");
 
@@ -105,12 +99,12 @@ pub fn run(args: OverviewArgs) -> Result<()> {
         output.push('\n');
     }
 
-    let output = if let Some(max_tokens) = args.tokens {
+    let output = if let Some(max_tokens) = common.tokens {
         crate::tokens::truncate_to_tokens(&output, max_tokens)
     } else {
         output
     };
-    let output = filter::maybe_filter(&output, &args.ask)?;
+    let output = filter::maybe_filter(&output, &common.ask)?;
     print!("{}", output);
     Ok(())
 }
@@ -125,10 +119,10 @@ fn truncate_lines(content: &str, max_lines: usize) -> String {
     }
 }
 
-fn build_compact_tree(root: &Path, max_depth: usize) -> Result<String> {
+fn build_compact_tree(root: &Path, max_depth: usize, common: &CommonArgs) -> Result<String> {
     use crate::walker;
 
-    let walker = walker::build_walker(root, true)
+    let walker = walker::build_walker(root, !common.no_gitignore)
         .max_depth(Some(max_depth))
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::filter;
 use crate::walker;
 
+use super::CommonArgs;
+
 #[derive(Args)]
 pub struct TreeArgs {
     /// Root directory to show tree for (default: current directory)
@@ -15,29 +17,13 @@ pub struct TreeArgs {
     /// Maximum depth to traverse
     #[arg(short = 'd', long = "depth", default_value = "4")]
     pub max_depth: usize,
-
-    /// Include gitignored files
-    #[arg(long = "no-gitignore")]
-    pub no_gitignore: bool,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-
-    /// Maximum output size in estimated tokens (truncates with notice)
-    #[arg(long)]
-    pub tokens: Option<usize>,
 }
 
-pub fn run(args: TreeArgs) -> Result<()> {
+pub fn run(args: TreeArgs, common: &CommonArgs) -> Result<()> {
     let root = args.path.canonicalize().unwrap_or(args.path.clone());
     let mut entries: Vec<PathBuf> = Vec::new();
 
-    let walker = walker::build_walker(&root, !args.no_gitignore)
+    let walker = walker::build_walker(&root, !common.no_gitignore)
         .max_depth(Some(args.max_depth))
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
@@ -49,7 +35,7 @@ pub fn run(args: TreeArgs) -> Result<()> {
         }
     }
 
-    if args.json {
+    if common.json {
         let json_entries: Vec<serde_json::Value> = entries
             .iter()
             .map(|p| {
@@ -61,23 +47,23 @@ pub fn run(args: TreeArgs) -> Result<()> {
             })
             .collect();
         let output = serde_json::to_string_pretty(&json_entries)?;
-        let output = if let Some(max_tokens) = args.tokens {
+        let output = if let Some(max_tokens) = common.tokens {
             crate::tokens::truncate_to_tokens(&output, max_tokens)
         } else {
             output
         };
-        let output = filter::maybe_filter(&output, &args.ask)?;
+        let output = filter::maybe_filter(&output, &common.ask)?;
         print!("{}", output);
         return Ok(());
     }
 
     let output = format_tree(&root, &entries);
-    let output = if let Some(max_tokens) = args.tokens {
+    let output = if let Some(max_tokens) = common.tokens {
         crate::tokens::truncate_to_tokens(&output, max_tokens)
     } else {
         output
     };
-    let output = filter::maybe_filter(&output, &args.ask)?;
+    let output = filter::maybe_filter(&output, &common.ask)?;
     print!("{}", output);
     Ok(())
 }

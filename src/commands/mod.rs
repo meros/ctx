@@ -7,7 +7,7 @@ pub mod overview;
 pub mod deps;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// ctx — Context gatherer for AI-assisted planning phases.
 ///
@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 ///   Need dependency chain?     → ctx deps file
 ///   Need directory layout?     → ctx tree path/ -d 3
 ///
-/// GLOBAL OPTIONS (available on most commands):
+/// GLOBAL OPTIONS (available on all commands, can go before or after subcommand):
 ///
 ///   --ask "question"   Filter output through Claude (smart extraction)
 ///   --tokens N         Truncate output to ~N estimated tokens
@@ -39,12 +39,18 @@ use clap::{Parser, Subcommand};
   ctx find '*.graphql'                         Find files matching glob pattern
   ctx grep 'fetchUser' --type ts               Search TypeScript files for pattern
   ctx grep 'fetchUser' --fn --no-tests         Show full function, skip test files
+  ctx grep 'foo|bar' --fn                      Alternation (use | not \\|)
   ctx grep 'TODO' --ask 'which are security-related?'
                                                LLM-filtered grep results
   ctx read src/a.ts src/b.ts                   Read multiple files, concatenated
   ctx read src/a.ts --lines 10-50              Read specific line range
   ctx symbols src/models/                      List all exports/types/interfaces
   ctx deps src/index.ts                        Show import dependency tree
+
+FLAGS CAN GO ANYWHERE:
+  ctx --tokens 500 grep 'pattern'              Before subcommand
+  ctx grep 'pattern' --tokens 500              After subcommand
+  ctx grep --tokens 500 'pattern' --fn         Mixed with subcommand flags
 
 TYPICAL WORKFLOW:
   1. ctx overview .                  Get the lay of the land
@@ -54,6 +60,29 @@ TYPICAL WORKFLOW:
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
+/// Global options available on all subcommands.
+#[derive(Args, Debug)]
+pub struct CommonArgs {
+    /// Filter output through Claude with a question
+    #[arg(long, global = true)]
+    pub ask: Option<String>,
+
+    /// Maximum output size in estimated tokens (truncates with notice)
+    #[arg(long, global = true)]
+    pub tokens: Option<usize>,
+
+    /// Output as JSON
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Include gitignored files
+    #[arg(long = "no-gitignore", global = true)]
+    pub no_gitignore: bool,
 }
 
 #[derive(Subcommand)]
@@ -86,16 +115,27 @@ pub enum Command {
 
     /// Search file contents for a pattern (regex).
     ///
-    /// Shells out to ripgrep for speed. Returns matches with context.
+    /// Uses Rust regex syntax (same as ripgrep). Returns matches with context.
     /// Use --type to filter by file extension.
     /// Use --fn to show the full enclosing function (replaces grep→read workflow).
     /// Use --no-tests to exclude test files from results.
     /// Use -e N to show N lines of expanded context around each match.
     ///
+    /// REGEX QUICK REFERENCE (Rust/ripgrep syntax):
+    ///   foo|bar        Alternation (match foo OR bar)
+    ///   (group)        Grouping (NOT \( \) like BRE)
+    ///   \bword\b       Word boundary
+    ///   (?i)pattern    Case-insensitive (or use -i flag)
+    ///   foo.*bar       foo followed by bar on same line
+    ///
+    /// NOTE: This is NOT GNU grep. Don't use \| \( \) — those match literals.
+    /// Common BRE patterns are auto-converted with a warning.
+    ///
     /// WHEN TO USE: Finding where symbols are defined/used, reading specific methods.
     ///
     /// EXAMPLES:
     ///   ctx grep 'fetchUser' --type ts          Find all references in TS files
+    ///   ctx grep 'fetch|send' --fn              Multiple patterns with alternation
     ///   ctx grep 'fetchUser' --fn --no-tests    Show full function, skip tests
     ///   ctx grep 'TODO' -e 5                    TODOs with 5 lines of context
     ///   ctx grep 'dbConnect' --ask 'which handle errors?'
@@ -155,12 +195,12 @@ pub enum Command {
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Tree(args) => tree::run(args),
-        Command::Find(args) => find::run(args),
-        Command::Grep(args) => grep::run(args),
-        Command::Read(args) => read::run(args),
-        Command::Symbols(args) => symbols::run(args),
-        Command::Overview(args) => overview::run(args),
-        Command::Deps(args) => deps::run(args),
+        Command::Tree(args) => tree::run(args, &cli.common),
+        Command::Find(args) => find::run(args, &cli.common),
+        Command::Grep(args) => grep::run(args, &cli.common),
+        Command::Read(args) => read::run(args, &cli.common),
+        Command::Symbols(args) => symbols::run(args, &cli.common),
+        Command::Overview(args) => overview::run(args, &cli.common),
+        Command::Deps(args) => deps::run(args, &cli.common),
     }
 }

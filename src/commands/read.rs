@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use crate::filter;
 use crate::ts;
 
+use super::CommonArgs;
+
 #[derive(Args)]
 pub struct ReadArgs {
     /// Files to read (supports multiple)
@@ -23,21 +25,9 @@ pub struct ReadArgs {
     /// Show only signatures/types/imports (tree-sitter skeleton, ~5-50x fewer tokens)
     #[arg(long)]
     pub skeleton: bool,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-
-    /// Maximum output size in estimated tokens (truncates with notice)
-    #[arg(long)]
-    pub tokens: Option<usize>,
 }
 
-pub fn run(args: ReadArgs) -> Result<()> {
+pub fn run(args: ReadArgs, common: &CommonArgs) -> Result<()> {
     let mut output = String::new();
     let (start_line, end_line) = parse_line_range(&args.line_range)?;
 
@@ -78,26 +68,26 @@ pub fn run(args: ReadArgs) -> Result<()> {
         }
     }
 
-    if args.json {
+    if common.json {
         let json = serde_json::json!({
             "files": args.files.iter().map(|f| f.to_string_lossy().to_string()).collect::<Vec<_>>(),
             "content": output,
         });
         let output = serde_json::to_string_pretty(&json)?;
-        let output = if let Some(max_tokens) = args.tokens {
+        let output = if let Some(max_tokens) = common.tokens {
             crate::tokens::truncate_to_tokens(&output, max_tokens)
         } else {
             output
         };
-        let output = filter::maybe_filter(&output, &args.ask)?;
+        let output = filter::maybe_filter(&output, &common.ask)?;
         print!("{}", output);
     } else {
-        let output = if let Some(max_tokens) = args.tokens {
+        let output = if let Some(max_tokens) = common.tokens {
             crate::tokens::truncate_to_tokens(&output, max_tokens)
         } else {
             output
         };
-        let output = filter::maybe_filter(&output, &args.ask)?;
+        let output = filter::maybe_filter(&output, &common.ask)?;
         print!("{}", output);
     }
 

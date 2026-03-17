@@ -7,6 +7,8 @@ use crate::filter;
 use crate::ts;
 use crate::walker;
 
+use super::CommonArgs;
+
 #[derive(Args)]
 pub struct SymbolsArgs {
     /// File or directory to extract symbols from
@@ -19,22 +21,10 @@ pub struct SymbolsArgs {
     /// Filter by file extension (e.g., ts, rs, py)
     #[arg(short = 't', long = "type")]
     pub file_type: Option<String>,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-
-    /// Maximum output size in estimated tokens (truncates with notice)
-    #[arg(long)]
-    pub tokens: Option<usize>,
 }
 
-pub fn run(args: SymbolsArgs) -> Result<()> {
-    let files = collect_files(&args)?;
+pub fn run(args: SymbolsArgs, common: &CommonArgs) -> Result<()> {
+    let files = collect_files(&args, common)?;
     let mut all_symbols: Vec<(String, ts::SymbolInfo)> = Vec::new();
     let mut parser = tree_sitter::Parser::new();
 
@@ -66,7 +56,7 @@ pub fn run(args: SymbolsArgs) -> Result<()> {
         }
     }
 
-    let output = if args.json {
+    let output = if common.json {
         let json: Vec<serde_json::Value> = all_symbols
             .iter()
             .map(|(file, sym)| {
@@ -106,23 +96,23 @@ pub fn run(args: SymbolsArgs) -> Result<()> {
         }
     };
 
-    let output = if let Some(max_tokens) = args.tokens {
+    let output = if let Some(max_tokens) = common.tokens {
         crate::tokens::truncate_to_tokens(&output, max_tokens)
     } else {
         output
     };
-    let output = filter::maybe_filter(&output, &args.ask)?;
+    let output = filter::maybe_filter(&output, &common.ask)?;
     print!("{}", output);
     Ok(())
 }
 
-fn collect_files(args: &SymbolsArgs) -> Result<Vec<PathBuf>> {
+fn collect_files(args: &SymbolsArgs, common: &CommonArgs) -> Result<Vec<PathBuf>> {
     if args.path.is_file() {
         return Ok(vec![args.path.clone()]);
     }
 
     let mut files = Vec::new();
-    let walker = walker::build_walker(&args.path, true).build();
+    let walker = walker::build_walker(&args.path, !common.no_gitignore).build();
 
     for entry in walker.flatten() {
         let path = entry.path().to_path_buf();

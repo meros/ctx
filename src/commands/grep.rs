@@ -11,9 +11,11 @@ use crate::filter;
 use crate::ts;
 use crate::walker;
 
+use super::CommonArgs;
+
 #[derive(Args)]
 pub struct GrepArgs {
-    /// Regex pattern to search for
+    /// Regex pattern to search for (Rust/ripgrep syntax: use | for alternation, () for grouping)
     pub pattern: String,
 
     /// Directory or file to search in
@@ -57,35 +59,85 @@ pub struct GrepArgs {
     /// Exclude test files (*.test.*, *.spec.*, *_test.*, test_*.*)
     #[arg(long = "no-tests")]
     pub no_tests: bool,
-
-    /// Include gitignored files
-    #[arg(long = "no-gitignore")]
-    pub no_gitignore: bool,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-
-    /// Maximum output size in estimated tokens (truncates with notice)
-    #[arg(long)]
-    pub tokens: Option<usize>,
 }
 
-pub fn run(args: GrepArgs) -> Result<()> {
-    let matcher = if args.ignore_case {
-        RegexMatcher::new_line_matcher(&format!("(?i){}", args.pattern))?
+/// Detect and convert common BRE (GNU grep basic regex) patterns to Rust/ERE regex.
+/// Returns (normalized_pattern, was_modified).
+fn normalize_pattern(pattern: &str) -> (String, bool) {
+    // Check for BRE-style escaped operators: \|, \(, \), \+, \?
+    // These are metacharacters in BRE but literal escapes in Rust regex.
+    // We need to be careful not to convert \\| (escaped backslash + pipe).
+    let mut result = String::with_capacity(pattern.len());
+    let mut modified = false;
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            // Check if this is a double backslash (\\) — skip both
+            if chars[i + 1] == '\\' {
+                result.push('\\');
+                result.push('\\');
+                i += 2;
+                continue;
+            }
+            // BRE metacharacters that should be unescaped for Rust regex
+            match chars[i + 1] {
+                '|' | '(' | ')' | '+' | '?' | '{' | '}' => {
+                    result.push(chars[i + 1]);
+                    modified = true;
+                    i += 2;
+                }
+                _ => {
+                    result.push('\\');
+                    result.push(chars[i + 1]);
+                    i += 2;
+                }
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    (result, modified)
+}
+
+pub fn run(args: GrepArgs, common: &CommonArgs) -> Result<()> {
+    // Normalize BRE patterns to Rust regex
+    let (pattern, was_normalized) = normalize_pattern(&args.pattern);
+    if was_normalized {
+        eprintln!(
+            "ctx: auto-converted BRE pattern '{}' → '{}' (ctx uses Rust/ripgrep regex syntax)",
+            args.pattern, pattern
+        );
+    }
+
+    let matcher = match if args.ignore_case {
+        RegexMatcher::new_line_matcher(&format!("(?i){}", pattern))
     } else {
-        RegexMatcher::new_line_matcher(&args.pattern)?
+        RegexMatcher::new_line_matcher(&pattern)
+    } {
+        Ok(m) => m,
+        Err(e) => {
+            anyhow::bail!(
+                "Invalid regex pattern '{}': {}\n\n\
+                 ctx uses Rust/ripgrep regex syntax:\n\
+                 - Alternation: foo|bar  (NOT foo\\|bar)\n\
+                 - Grouping:    (a|b)    (NOT \\(a\\|b\\))\n\
+                 - Quantifiers: a+  a?   (NOT a\\+ a\\?)\n\
+                 - Word boundary: \\bword\\b\n\
+                 - Case-insensitive: (?i)pattern or -i flag\n\
+                 See: https://docs.rs/regex/latest/regex/#syntax",
+                args.pattern, e
+            );
+        }
     };
 
     // Collect matching files and line numbers
     // Cache file content alongside matches to avoid double-reads in format functions
     let mut file_matches: FileMatches = BTreeMap::new();
-    let files = collect_search_files(&args)?;
+    let files = collect_search_files(&args, common)?;
     let needs_content = !args.files_only && !args.count;
 
     let mut searcher = Searcher::new();
@@ -128,23 +180,23 @@ pub fn run(args: GrepArgs) -> Result<()> {
         format_context(&file_matches, &args)?
     };
 
-    let output = if let Some(max_tokens) = args.tokens {
+    let output = if let Some(max_tokens) = common.tokens {
         crate::tokens::truncate_to_tokens(&output, max_tokens)
     } else {
         output
     };
-    let output = filter::maybe_filter(&output, &args.ask)?;
+    let output = filter::maybe_filter(&output, &common.ask)?;
     print!("{}", output);
     Ok(())
 }
 
-fn collect_search_files(args: &GrepArgs) -> Result<Vec<PathBuf>> {
+fn collect_search_files(args: &GrepArgs, common: &CommonArgs) -> Result<Vec<PathBuf>> {
     if args.path.is_file() {
         return Ok(vec![args.path.clone()]);
     }
 
     let mut files = Vec::new();
-    let walker = walker::build_walker(&args.path, !args.no_gitignore).build();
+    let walker = walker::build_walker(&args.path, !common.no_gitignore).build();
 
     for entry in walker.flatten() {
         let path = entry.path().to_path_buf();
@@ -339,4 +391,58 @@ fn merge_ranges(ranges: &mut [(usize, usize, usize)]) -> Vec<(usize, usize, Vec<
     merged.push((cur_start, cur_end, cur_matches));
 
     merged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_bre_alternation() {
+        let (result, modified) = normalize_pattern(r"foo\|bar\|baz");
+        assert_eq!(result, "foo|bar|baz");
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_normalize_bre_groups() {
+        let (result, modified) = normalize_pattern(r"\(foo\|bar\)");
+        assert_eq!(result, "(foo|bar)");
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_normalize_bre_quantifiers() {
+        let (result, modified) = normalize_pattern(r"foo\+bar\?");
+        assert_eq!(result, "foo+bar?");
+        assert!(modified);
+    }
+
+    #[test]
+    fn test_normalize_preserves_valid_escapes() {
+        let (result, modified) = normalize_pattern(r"\bword\b");
+        assert_eq!(result, r"\bword\b");
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_normalize_preserves_double_backslash() {
+        let (result, modified) = normalize_pattern(r"foo\\|bar");
+        assert_eq!(result, r"foo\\|bar");
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_normalize_plain_alternation_unchanged() {
+        let (result, modified) = normalize_pattern("foo|bar");
+        assert_eq!(result, "foo|bar");
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_normalize_no_change() {
+        let (result, modified) = normalize_pattern("simple");
+        assert_eq!(result, "simple");
+        assert!(!modified);
+    }
 }

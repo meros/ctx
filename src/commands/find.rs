@@ -4,7 +4,10 @@ use globset::Glob;
 use std::path::PathBuf;
 
 use crate::filter;
+use crate::tokens;
 use crate::walker;
+
+use super::CommonArgs;
 
 #[derive(Args)]
 pub struct FindArgs {
@@ -22,24 +25,12 @@ pub struct FindArgs {
     /// Maximum number of results
     #[arg(short = 'n', long, default_value = "500")]
     pub limit: usize,
-
-    /// Include gitignored files
-    #[arg(long = "no-gitignore")]
-    pub no_gitignore: bool,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
 }
 
-pub fn run(args: FindArgs) -> Result<()> {
+pub fn run(args: FindArgs, common: &CommonArgs) -> Result<()> {
     let glob = Glob::new(&args.pattern)?.compile_matcher();
 
-    let walker = walker::build_walker(&args.path, !args.no_gitignore).build();
+    let walker = walker::build_walker(&args.path, !common.no_gitignore).build();
 
     let mut results: Vec<String> = Vec::new();
 
@@ -71,7 +62,7 @@ pub fn run(args: FindArgs) -> Result<()> {
 
     results.sort();
 
-    let output = if args.json {
+    let output = if common.json {
         serde_json::to_string_pretty(&results)?
     } else if results.is_empty() {
         String::new()
@@ -79,7 +70,12 @@ pub fn run(args: FindArgs) -> Result<()> {
         results.join("\n") + "\n"
     };
 
-    let output = filter::maybe_filter(&output, &args.ask)?;
+    let output = if let Some(max_tokens) = common.tokens {
+        tokens::truncate_to_tokens(&output, max_tokens)
+    } else {
+        output
+    };
+    let output = filter::maybe_filter(&output, &common.ask)?;
     print!("{}", output);
     Ok(())
 }

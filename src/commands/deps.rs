@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::filter;
 use crate::ts;
 
+use super::CommonArgs;
+
 #[derive(Args)]
 pub struct DepsArgs {
     /// File to trace dependencies for
@@ -23,21 +25,9 @@ pub struct DepsArgs {
     /// Only show local (relative) imports
     #[arg(long = "local")]
     pub local_only: bool,
-
-    /// Filter output through Claude with a question
-    #[arg(long)]
-    pub ask: Option<String>,
-
-    /// Output as JSON
-    #[arg(long)]
-    pub json: bool,
-
-    /// Maximum output size in estimated tokens (truncates with notice)
-    #[arg(long)]
-    pub tokens: Option<usize>,
 }
 
-pub fn run(args: DepsArgs) -> Result<()> {
+pub fn run(args: DepsArgs, common: &CommonArgs) -> Result<()> {
     let file = args.file.canonicalize()
         .with_context(|| format!("File not found: {}", args.file.display()))?;
 
@@ -47,12 +37,12 @@ pub fn run(args: DepsArgs) -> Result<()> {
     output.push_str(&format!("Dependencies for: {}\n\n", args.file.display()));
     trace_deps(&file, 0, args.max_depth, &mut visited, &mut output, &args)?;
 
-    let output = if let Some(max_tokens) = args.tokens {
+    let output = if let Some(max_tokens) = common.tokens {
         crate::tokens::truncate_to_tokens(&output, max_tokens)
     } else {
         output
     };
-    let output = filter::maybe_filter(&output, &args.ask)?;
+    let output = filter::maybe_filter(&output, &common.ask)?;
     print!("{}", output);
     Ok(())
 }
