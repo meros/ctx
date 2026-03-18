@@ -18,7 +18,7 @@ pub struct GrepArgs {
     /// Regex pattern to search for (Rust/ripgrep syntax: use | for alternation, () for grouping)
     pub pattern: String,
 
-    /// Directories or files to search in (multiple allowed)
+    /// Paths to search (use -- before paths: ctx grep 'pat' -- src/ lib/)
     #[arg(default_value = ".")]
     pub paths: Vec<PathBuf>,
 
