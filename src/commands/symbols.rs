@@ -3,7 +3,6 @@ use clap::Args;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::filter;
 use crate::ts;
 use crate::walker;
 
@@ -96,13 +95,7 @@ pub fn run(args: SymbolsArgs, common: &CommonArgs) -> Result<()> {
         }
     };
 
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 

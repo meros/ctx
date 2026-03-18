@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::filter;
 use crate::ts;
 
 use super::CommonArgs;
@@ -37,13 +36,7 @@ pub fn run(args: DepsArgs, common: &CommonArgs) -> Result<()> {
     output.push_str(&format!("Dependencies for: {}\n\n", args.file.display()));
     trace_deps(&file, 0, args.max_depth, &mut visited, &mut output, &args)?;
 
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 
@@ -95,7 +88,7 @@ fn trace_deps(
 
         // Recursively trace local imports
         if is_local && depth < max_depth {
-            if let Some(resolved) = resolve_import(&import.path, file) {
+            if let Some(resolved) = crate::resolve::resolve_import(&import.path, file) {
                 trace_deps(&resolved, depth + 1, max_depth, visited, output, args)?;
             }
         }
@@ -104,31 +97,3 @@ fn trace_deps(
     Ok(())
 }
 
-fn resolve_import(import_path: &str, from_file: &Path) -> Option<PathBuf> {
-    let dir = from_file.parent()?;
-    let candidate = dir.join(import_path);
-
-    // Try exact path
-    if candidate.exists() && candidate.is_file() {
-        return Some(candidate);
-    }
-
-    // Try common extensions
-    let extensions = ["ts", "tsx", "js", "jsx", "rs", "py"];
-    for ext in &extensions {
-        let with_ext = candidate.with_extension(ext);
-        if with_ext.exists() {
-            return Some(with_ext);
-        }
-    }
-
-    // Try index file in directory
-    for ext in &extensions {
-        let index = candidate.join(format!("index.{}", ext));
-        if index.exists() {
-            return Some(index);
-        }
-    }
-
-    None
-}

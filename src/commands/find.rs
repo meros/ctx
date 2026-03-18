@@ -3,8 +3,6 @@ use clap::Args;
 use globset::Glob;
 use std::path::PathBuf;
 
-use crate::filter;
-use crate::tokens;
 use crate::walker;
 
 use super::CommonArgs;
@@ -70,12 +68,6 @@ pub fn run(args: FindArgs, common: &CommonArgs) -> Result<()> {
         results.join("\n") + "\n"
     };
 
-    let output = if let Some(max_tokens) = common.tokens {
-        tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }

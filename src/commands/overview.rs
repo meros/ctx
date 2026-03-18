@@ -3,8 +3,6 @@ use clap::Args;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::filter;
-
 use super::CommonArgs;
 
 #[derive(Args)]
@@ -99,13 +97,7 @@ pub fn run(args: OverviewArgs, common: &CommonArgs) -> Result<()> {
         output.push('\n');
     }
 
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 

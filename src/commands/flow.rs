@@ -5,9 +5,8 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::filter;
 use crate::ts::{self, RefKind};
 use crate::walker;
 
@@ -83,45 +82,50 @@ pub fn run(args: FlowArgs, common: &CommonArgs) -> Result<()> {
     let mut parser = tree_sitter::Parser::new();
 
     for (file_path, match_lines) in &file_lines {
-        let lang = match ts::Lang::from_path(file_path) {
-            Some(l) => l,
-            None => continue,
-        };
-
         let content = match fs::read_to_string(file_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        let tree = match ts::parse_with(&mut parser, &content, lang) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
         let source_lines: Vec<&str> = content.lines().collect();
+        let lang = ts::Lang::from_path(file_path);
+
+        // Try AST-based classification if tree-sitter supports this language
+        let tree = lang.and_then(|l| ts::parse_with(&mut parser, &content, l).ok());
 
         for &line in match_lines {
-            let idents = ts::find_identifiers_on_line(&tree, &content, line, &args.symbol);
+            if let (Some(ref tree), Some(lang)) = (&tree, lang) {
+                // AST-aware classification
+                let idents = ts::find_identifiers_on_line(tree, &content, line, &args.symbol);
 
-            if idents.is_empty() {
-                // Symbol is in a comment or string — skip
-                continue;
-            }
-
-            // Classify each identifier, dedup by kind per line
-            let mut seen_kinds: HashSet<RefKind> = HashSet::new();
-            for ident_node in &idents {
-                let kind = ts::classify_identifier(*ident_node, &content, lang);
-                if seen_kinds.insert(kind) {
-                    let snippet =
-                        extract_snippet(&source_lines, line, kind, &tree, &content, lang);
-                    sites.push(FlowSite {
-                        file: file_path.clone(),
-                        line,
-                        kind,
-                        snippet,
-                    });
+                if idents.is_empty() {
+                    // Symbol is in a comment or string — skip
+                    continue;
                 }
+
+                let mut seen_kinds: HashSet<RefKind> = HashSet::new();
+                for ident_node in &idents {
+                    let kind = ts::classify_identifier(*ident_node, &content, lang);
+                    if seen_kinds.insert(kind) {
+                        let snippet =
+                            extract_snippet(&source_lines, line, kind, tree, &content, lang);
+                        sites.push(FlowSite {
+                            file: file_path.clone(),
+                            line,
+                            kind,
+                            snippet,
+                        });
+                    }
+                }
+            } else {
+                // No tree-sitter support — emit as READ with raw grep snippet
+                let snippet = format_raw_snippet(&source_lines, line);
+                sites.push(FlowSite {
+                    file: file_path.clone(),
+                    line,
+                    kind: RefKind::Read,
+                    snippet,
+                });
             }
         }
     }
@@ -150,13 +154,7 @@ pub fn run(args: FlowArgs, common: &CommonArgs) -> Result<()> {
         render_text(&args.symbol, &sites)
     };
 
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 
@@ -248,6 +246,18 @@ fn render_json(symbol: &str, sites: &[FlowSite]) -> Result<String> {
     Ok(serde_json::to_string_pretty(&json)?)
 }
 
+/// Format a raw snippet for files without tree-sitter support.
+fn format_raw_snippet(lines: &[&str], target: usize) -> String {
+    let total = lines.len();
+    let (start, end) = ctx_range(target, 2, total);
+    let mut snippet = String::new();
+    for i in start..=end.min(total.saturating_sub(1)) {
+        let marker = if i == target { ">" } else { " " };
+        snippet.push_str(&format!("{}{:4} {}\n", marker, i + 1, lines[i]));
+    }
+    snippet
+}
+
 fn collect_files(args: &FlowArgs, common: &CommonArgs) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
@@ -271,30 +281,16 @@ fn collect_files(args: &FlowArgs, common: &CommonArgs) -> Result<Vec<PathBuf>> {
                 }
             }
 
-            if args.no_tests && is_test_file(&path) {
+            if args.no_tests && walker::is_test_file(&path) {
                 continue;
             }
 
-            // Only include files tree-sitter can parse
-            if ts::Lang::from_path(&path).is_some() {
-                files.push(path);
-            }
+            files.push(path);
         }
     }
 
     files.sort();
     Ok(files)
-}
-
-fn is_test_file(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    name.contains(".test.")
-        || name.contains(".spec.")
-        || name.contains("_test.")
-        || name.starts_with("test_")
 }
 
 /// Escape regex-special characters in a symbol name.

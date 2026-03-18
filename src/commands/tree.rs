@@ -3,7 +3,6 @@ use clap::Args;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::filter;
 use crate::walker;
 
 use super::CommonArgs;
@@ -47,24 +46,12 @@ pub fn run(args: TreeArgs, common: &CommonArgs) -> Result<()> {
             })
             .collect();
         let output = serde_json::to_string_pretty(&json_entries)?;
-        let output = if let Some(max_tokens) = common.tokens {
-            crate::tokens::truncate_to_tokens(&output, max_tokens)
-        } else {
-            output
-        };
-        let output = filter::maybe_filter(&output, &common.ask)?;
-        print!("{}", output);
+        crate::output::emit(&output, common)?;
         return Ok(());
     }
 
     let output = format_tree(&root, &entries);
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 

@@ -5,9 +5,8 @@ use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::filter;
 use crate::ts;
 use crate::walker;
 
@@ -180,13 +179,7 @@ pub fn run(args: GrepArgs, common: &CommonArgs) -> Result<()> {
         format_context(&file_matches, &args)?
     };
 
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 
@@ -213,7 +206,7 @@ fn collect_search_files(args: &GrepArgs, common: &CommonArgs) -> Result<Vec<Path
                 }
             }
 
-            if args.no_tests && is_test_file(&path) {
+            if args.no_tests && walker::is_test_file(&path) {
                 continue;
             }
 
@@ -222,18 +215,6 @@ fn collect_search_files(args: &GrepArgs, common: &CommonArgs) -> Result<Vec<Path
     }
 
     Ok(files)
-}
-
-fn is_test_file(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    name.contains(".test.")
-        || name.contains(".spec.")
-        || name.contains("_test.")
-        || name.starts_with("test_")
-        || name.contains(".mocha.")
 }
 
 type FileMatches = BTreeMap<PathBuf, (Vec<(u64, String)>, Option<String>)>;
