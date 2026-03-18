@@ -42,6 +42,7 @@ use clap::{Args, Parser, Subcommand};
   ctx grep 'foo|bar' --fn                      Alternation (use | not \\|)
   ctx grep 'TODO' --ask 'which are security-related?'
                                                LLM-filtered grep results
+  ctx grep 'handler' -- src/ lib/              Search multiple directories
   ctx read src/a.ts src/b.ts                   Read multiple files, concatenated
   ctx read src/a.ts --lines 10-50              Read specific line range
   ctx symbols src/models/                      List all exports/types/interfaces
@@ -140,6 +141,7 @@ pub enum Command {
     ///   ctx grep 'TODO' -e 5                    TODOs with 5 lines of context
     ///   ctx grep 'dbConnect' --ask 'which handle errors?'
     ///                                           LLM-filtered results
+    ///   ctx grep 'handler' -- src/ lib/         Search multiple directories
     Grep(grep::GrepArgs),
 
     /// Read one or more files, concatenated with headers.

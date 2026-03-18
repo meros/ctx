@@ -32,7 +32,8 @@ cargo build --release
 
 - **Read-only**: All commands are safe, no writes. Designed for the PLAN phase.
 - **Self-documenting**: `ctx --help` and `ctx <cmd> --help` are the complete documentation. No separate reference card needed.
-- **`--ask` flag**: Any command can pipe its output through Claude for smart filtering/summarization, keeping the main conversation context clean.
+- **Global flags**: `--ask`, `--tokens`, `--json`, `--no-gitignore` work on all subcommands and can be placed anywhere in the command line (before or after the subcommand).
+- **BRE auto-conversion**: `ctx grep` uses Rust/ripgrep regex syntax. Common BRE patterns (`\|`, `\(`, `\)`, `\+`, `\?`) are auto-detected and converted with a stderr warning. Invalid patterns show a helpful syntax quick-reference.
 - **Native Rust implementation**: Uses `grep-regex`/`grep-searcher` (ripgrep's libraries) and `tree-sitter` directly — no external tool dependencies.
 - **Respects .gitignore**: All file walking uses the `ignore` crate.
 

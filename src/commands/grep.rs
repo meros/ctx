@@ -18,9 +18,9 @@ pub struct GrepArgs {
     /// Regex pattern to search for (Rust/ripgrep syntax: use | for alternation, () for grouping)
     pub pattern: String,
 
-    /// Directory or file to search in
+    /// Directories or files to search in (multiple allowed)
     #[arg(default_value = ".")]
-    pub path: PathBuf,
+    pub paths: Vec<PathBuf>,
 
     /// Filter by file type extension (e.g., ts, rs, py)
     #[arg(short = 't', long = "type")]
@@ -191,30 +191,34 @@ pub fn run(args: GrepArgs, common: &CommonArgs) -> Result<()> {
 }
 
 fn collect_search_files(args: &GrepArgs, common: &CommonArgs) -> Result<Vec<PathBuf>> {
-    if args.path.is_file() {
-        return Ok(vec![args.path.clone()]);
-    }
-
     let mut files = Vec::new();
-    let walker = walker::build_walker(&args.path, !common.no_gitignore).build();
 
-    for entry in walker.flatten() {
-        let path = entry.path().to_path_buf();
-        if !path.is_file() {
+    for root in &args.paths {
+        if root.is_file() {
+            files.push(root.clone());
             continue;
         }
 
-        if let Some(ref ext) = args.file_type {
-            if path.extension().and_then(|e| e.to_str()) != Some(ext.as_str()) {
+        let walker = walker::build_walker(root, !common.no_gitignore).build();
+
+        for entry in walker.flatten() {
+            let path = entry.path().to_path_buf();
+            if !path.is_file() {
                 continue;
             }
-        }
 
-        if args.no_tests && is_test_file(&path) {
-            continue;
-        }
+            if let Some(ref ext) = args.file_type {
+                if path.extension().and_then(|e| e.to_str()) != Some(ext.as_str()) {
+                    continue;
+                }
+            }
 
-        files.push(path);
+            if args.no_tests && is_test_file(&path) {
+                continue;
+            }
+
+            files.push(path);
+        }
     }
 
     Ok(files)
