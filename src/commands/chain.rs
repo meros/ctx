@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::filter;
+use crate::resolve;
 use crate::ts;
 use crate::walker;
 
@@ -71,14 +71,7 @@ pub fn run(args: ChainArgs, common: &CommonArgs) -> Result<()> {
         render_traversal(&file, &graph.reverse, "reverse", &args, common)?
     };
 
-    let output = if let Some(max_tokens) = common.tokens {
-        crate::tokens::truncate_to_tokens(&output, max_tokens)
-    } else {
-        output
-    };
-    let output = filter::maybe_filter(&output, &common.ask)?;
-    print!("{}", output);
-    Ok(())
+    crate::output::emit(&output, common)
 }
 
 fn find_project_root(from: &Path) -> Option<PathBuf> {
@@ -112,7 +105,7 @@ fn build_import_graph(root: &Path, args: &ChainArgs, common: &CommonArgs) -> Res
         }
 
         // Skip test files if requested
-        if args.no_tests && is_test_file(&path) {
+        if args.no_tests && walker::is_test_file(&path) {
             continue;
         }
 
@@ -140,7 +133,7 @@ fn build_import_graph(root: &Path, args: &ChainArgs, common: &CommonArgs) -> Res
                 continue;
             }
 
-            if let Some(resolved) = resolve_import(&import.path, &canonical_path) {
+            if let Some(resolved) = resolve::resolve_import(&import.path, &canonical_path) {
                 let resolved = resolved.canonicalize().unwrap_or(resolved);
                 forward.entry(canonical_path.clone()).or_default().push(resolved.clone());
                 reverse.entry(resolved).or_default().push(canonical_path.clone());
@@ -408,46 +401,6 @@ fn path_length(visited: &HashMap<PathBuf, Option<PathBuf>>, node: &Path) -> usiz
         current = prev.clone();
     }
     len
-}
-
-fn resolve_import(import_path: &str, from_file: &Path) -> Option<PathBuf> {
-    let dir = from_file.parent()?;
-    let candidate = dir.join(import_path);
-
-    // Try exact path
-    if candidate.exists() && candidate.is_file() {
-        return Some(candidate);
-    }
-
-    // Try common extensions
-    let extensions = ["ts", "tsx", "js", "jsx", "rs", "py"];
-    for ext in &extensions {
-        let with_ext = candidate.with_extension(ext);
-        if with_ext.exists() {
-            return Some(with_ext);
-        }
-    }
-
-    // Try index file in directory
-    for ext in &extensions {
-        let index = candidate.join(format!("index.{}", ext));
-        if index.exists() {
-            return Some(index);
-        }
-    }
-
-    None
-}
-
-fn is_test_file(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    name.contains(".test.")
-        || name.contains(".spec.")
-        || name.contains("_test.")
-        || name.starts_with("test_")
 }
 
 /// Get a relative path string from a file to a root.
