@@ -1089,3 +1089,377 @@ fn first_line(node: Node, source: &str) -> String {
         .trim()
         .to_string()
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Reference classification for `ctx flow`
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// How a symbol is used at a specific AST location.
+/// Variant order defines the narrative flow in output: imports → definitions → usage → output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RefKind {
+    Import,
+    Definition,
+    TypeDefinition,
+    Export,
+    PropReceive,
+    Call,
+    PropPass,
+    ConditionalUse,
+    ReturnValue,
+    Mutation,
+    Read,
+}
+
+impl RefKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Import => "IMPORT",
+            Self::Definition => "DEFINITION",
+            Self::TypeDefinition => "TYPE",
+            Self::Export => "EXPORT",
+            Self::PropReceive => "PROP RECEIVE",
+            Self::Call => "CALL",
+            Self::PropPass => "PROP PASS",
+            Self::ConditionalUse => "CONDITIONAL",
+            Self::ReturnValue => "RETURN",
+            Self::Mutation => "MUTATION",
+            Self::Read => "READ",
+        }
+    }
+}
+
+impl std::fmt::Display for RefKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Identifier-like node kinds across all supported languages.
+const IDENT_KINDS: &[&str] = &[
+    // TS/TSX/JS
+    "identifier",
+    "property_identifier",
+    "shorthand_property_identifier",
+    "shorthand_property_identifier_pattern",
+    "type_identifier",
+    // Rust
+    "field_identifier",
+    // Python uses "identifier" (already listed)
+];
+
+/// Find all identifier nodes matching `symbol` on a given line (0-indexed).
+pub fn find_identifiers_on_line<'a>(
+    tree: &'a Tree,
+    source: &str,
+    line: usize,
+    symbol: &str,
+) -> Vec<Node<'a>> {
+    let mut results = Vec::new();
+    find_idents_recursive(tree.root_node(), source, line, symbol, &mut results);
+    results
+}
+
+fn find_idents_recursive<'a>(
+    node: Node<'a>,
+    source: &str,
+    target_line: usize,
+    symbol: &str,
+    results: &mut Vec<Node<'a>>,
+) {
+    let start_row = node.start_position().row;
+    let end_row = node.end_position().row;
+
+    // Skip subtrees that can't contain the target line
+    if target_line < start_row || target_line > end_row {
+        return;
+    }
+
+    // Check if this is a matching identifier on the target line
+    if start_row == target_line && IDENT_KINDS.contains(&node.kind()) {
+        if node.utf8_text(source.as_bytes()).ok() == Some(symbol) {
+            results.push(node);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_idents_recursive(child, source, target_line, symbol, results);
+    }
+}
+
+/// Classify how an identifier node is used by walking up the AST.
+pub fn classify_identifier(ident: Node, source: &str, lang: Lang) -> RefKind {
+    match lang {
+        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => classify_ident_ts(ident, source),
+        Lang::Rust => classify_ident_rust(ident),
+        Lang::Python => classify_ident_python(ident),
+    }
+}
+
+/// Check if `target` is within `container`'s byte range.
+fn node_contains_node(container: Node, target: Node) -> bool {
+    container.start_byte() <= target.start_byte() && target.end_byte() <= container.end_byte()
+}
+
+/// Check if `target` is within the named field of `parent`.
+fn is_in_field(parent: Node, field: &str, target: Node) -> bool {
+    parent
+        .child_by_field_name(field)
+        .map(|n| node_contains_node(n, target))
+        .unwrap_or(false)
+}
+
+fn classify_ident_ts(ident: Node, _source: &str) -> RefKind {
+    let mut current = ident;
+
+    for _ in 0..20 {
+        let parent = match current.parent() {
+            Some(p) => p,
+            None => break,
+        };
+
+        match parent.kind() {
+            // ── Imports ──
+            "import_specifier" | "import_clause" | "import_statement" | "namespace_import" => {
+                return RefKind::Import;
+            }
+
+            // ── Exports ──
+            "export_specifier" | "export_clause" => return RefKind::Export,
+            "export_statement" => {
+                // `export default foo` → direct child of export_statement
+                if current.id() == ident.id() {
+                    return RefKind::Export;
+                }
+                // Inside a declaration within export (export const foo = bar) → keep walking
+                // will have been caught by variable_declarator/function_declaration etc.
+            }
+
+            // ── Declarations ──
+            "variable_declarator" => {
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::Definition;
+                }
+            }
+            "function_declaration" | "generator_function_declaration" | "method_definition"
+            | "class_declaration" | "abstract_class_declaration" => {
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::Definition;
+                }
+            }
+
+            // ── Calls ──
+            "call_expression" | "new_expression" => {
+                if is_in_field(parent, "function", ident) {
+                    return RefKind::Call;
+                }
+            }
+
+            // ── JSX ──
+            "jsx_attribute" => return RefKind::PropPass,
+            "jsx_opening_element" | "jsx_self_closing_element" => {
+                // <OurSymbol /> — component usage is like a call
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::Call;
+                }
+            }
+
+            // ── Parameters / Destructuring ──
+            "required_parameter" | "optional_parameter" => {
+                return RefKind::PropReceive;
+            }
+            "object_pattern" => {
+                if let Some(gp) = parent.parent() {
+                    match gp.kind() {
+                        "required_parameter" | "optional_parameter" => {
+                            return RefKind::PropReceive;
+                        }
+                        "variable_declarator" if is_in_field(gp, "name", parent) => {
+                            return RefKind::Definition;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "array_pattern" => {
+                if let Some(gp) = parent.parent() {
+                    if gp.kind() == "variable_declarator" && is_in_field(gp, "name", parent) {
+                        return RefKind::Definition;
+                    }
+                }
+            }
+
+            // ── Types ──
+            "property_signature" | "method_signature" => return RefKind::TypeDefinition,
+            "type_alias_declaration" | "interface_declaration" | "enum_declaration" => {
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::TypeDefinition;
+                }
+                return RefKind::TypeDefinition;
+            }
+            "type_annotation" | "type_arguments" | "constraint" => {
+                return RefKind::TypeDefinition;
+            }
+
+            // ── Mutation ──
+            "assignment_expression" | "augmented_assignment_expression" => {
+                if is_in_field(parent, "left", ident) {
+                    return RefKind::Mutation;
+                }
+            }
+            "update_expression" => return RefKind::Mutation,
+
+            // ── Control flow ──
+            "return_statement" => return RefKind::ReturnValue,
+            "if_statement" | "while_statement" | "do_statement" | "switch_statement" => {
+                if is_in_field(parent, "condition", ident) {
+                    return RefKind::ConditionalUse;
+                }
+            }
+            "ternary_expression" => {
+                if is_in_field(parent, "condition", ident) {
+                    return RefKind::ConditionalUse;
+                }
+            }
+
+            _ => {}
+        }
+
+        current = parent;
+    }
+
+    RefKind::Read
+}
+
+fn classify_ident_rust(ident: Node) -> RefKind {
+    let mut current = ident;
+
+    for _ in 0..20 {
+        let parent = match current.parent() {
+            Some(p) => p,
+            None => break,
+        };
+
+        match parent.kind() {
+            "use_declaration" | "use_as_clause" | "use_list" | "use_wildcard" => {
+                return RefKind::Import;
+            }
+            // scoped_identifier is used both in `use` paths and in expressions
+            // (e.g., `ts::foo()`). Only classify as Import if inside a use_declaration.
+            "scoped_identifier" => {
+                let mut ancestor = parent;
+                for _ in 0..10 {
+                    match ancestor.parent() {
+                        Some(a) if a.kind() == "use_declaration" => return RefKind::Import,
+                        Some(a) if a.kind() == "scoped_identifier" => { ancestor = a; }
+                        _ => break,
+                    }
+                }
+                // Not inside use — continue walking (call_expression will catch it)
+            }
+            "function_item" | "const_item" | "static_item" | "let_declaration" => {
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::Definition;
+                }
+            }
+            "struct_item" | "enum_item" | "trait_item" | "type_item" => {
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::TypeDefinition;
+                }
+            }
+            "impl_item" => {
+                if is_in_field(parent, "type", ident) || is_in_field(parent, "trait", ident) {
+                    return RefKind::TypeDefinition;
+                }
+            }
+            "call_expression" => {
+                if is_in_field(parent, "function", ident) {
+                    return RefKind::Call;
+                }
+            }
+            "macro_invocation" => {
+                if is_in_field(parent, "macro", ident) {
+                    return RefKind::Call;
+                }
+            }
+            "assignment_expression" | "compound_assignment_expr" => {
+                if is_in_field(parent, "left", ident) {
+                    return RefKind::Mutation;
+                }
+            }
+            "return_expression" => return RefKind::ReturnValue,
+            "if_expression" | "while_expression" => {
+                if is_in_field(parent, "condition", ident) {
+                    return RefKind::ConditionalUse;
+                }
+            }
+            "parameter" | "self_parameter" => return RefKind::PropReceive,
+            _ => {}
+        }
+
+        current = parent;
+    }
+
+    RefKind::Read
+}
+
+fn classify_ident_python(ident: Node) -> RefKind {
+    let mut current = ident;
+
+    for _ in 0..20 {
+        let parent = match current.parent() {
+            Some(p) => p,
+            None => break,
+        };
+
+        match parent.kind() {
+            "import_statement" | "import_from_statement" | "aliased_import" => {
+                return RefKind::Import;
+            }
+            "dotted_name" => {
+                // Check if this dotted_name is part of an import
+                if let Some(gp) = parent.parent() {
+                    if gp.kind() == "import_statement" || gp.kind() == "import_from_statement" {
+                        return RefKind::Import;
+                    }
+                }
+            }
+            "function_definition" | "class_definition" => {
+                if is_in_field(parent, "name", ident) {
+                    return RefKind::Definition;
+                }
+            }
+            "assignment" => {
+                if is_in_field(parent, "left", ident) {
+                    return RefKind::Definition;
+                }
+            }
+            "augmented_assignment" => {
+                if is_in_field(parent, "left", ident) {
+                    return RefKind::Mutation;
+                }
+            }
+            "call" => {
+                if is_in_field(parent, "function", ident) {
+                    return RefKind::Call;
+                }
+            }
+            "return_statement" => return RefKind::ReturnValue,
+            "if_statement" | "while_statement" | "elif_clause" => {
+                if is_in_field(parent, "condition", ident) {
+                    return RefKind::ConditionalUse;
+                }
+            }
+            "parameters" | "default_parameter" | "typed_parameter"
+            | "typed_default_parameter" => {
+                return RefKind::PropReceive;
+            }
+            _ => {}
+        }
+
+        current = parent;
+    }
+
+    RefKind::Read
+}

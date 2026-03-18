@@ -23,9 +23,9 @@ cargo build --release
 
 - `src/main.rs` — Entry point
 - `src/commands/mod.rs` — CLI definition (clap derive), help text
-- `src/commands/{tree,find,grep,read,symbols,overview,deps}.rs` — Individual commands
+- `src/commands/{tree,find,grep,read,symbols,overview,deps,flow}.rs` — Individual commands
 - `src/walker.rs` — Shared gitignore-aware file walker with noise directory filtering
-- `src/ts.rs` — Tree-sitter integration (parsing, symbol extraction, import analysis, function detection)
+- `src/ts.rs` — Tree-sitter integration (parsing, symbol extraction, import analysis, function detection, reference classification)
 - `src/filter.rs` — `--ask` flag implementation (pipes through `claude -p`)
 
 ## Key Design Decisions
@@ -45,4 +45,5 @@ cargo run -- tree src/ -d 3
 cargo run -- grep 'pattern' --type rs
 cargo run -- find '*.rs'
 cargo run -- symbols src/ --type rs
+cargo run -- flow RefKind --type rs
 ```

@@ -5,6 +5,7 @@ pub mod read;
 pub mod symbols;
 pub mod overview;
 pub mod deps;
+pub mod flow;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -23,6 +24,7 @@ use clap::{Args, Parser, Subcommand};
 ///   Need file contents?        → ctx read file1 file2
 ///   Need a module's API?       → ctx symbols path/
 ///   Need dependency chain?     → ctx deps file
+///   How does a value flow?     → ctx flow symbol
 ///   Need directory layout?     → ctx tree path/ -d 3
 ///
 /// GLOBAL OPTIONS (available on all commands, can go before or after subcommand):
@@ -47,6 +49,8 @@ use clap::{Args, Parser, Subcommand};
   ctx read src/a.ts --lines 10-50              Read specific line range
   ctx symbols src/models/                      List all exports/types/interfaces
   ctx deps src/index.ts                        Show import dependency tree
+  ctx flow fetchUser                           Trace symbol through codebase
+  ctx flow fetchUser --type ts --no-tests      Trace in TS files, skip tests
 
 FLAGS CAN GO ANYWHERE:
   ctx --tokens 500 grep 'pattern'              Before subcommand
@@ -57,7 +61,8 @@ TYPICAL WORKFLOW:
   1. ctx overview .                  Get the lay of the land
   2. ctx grep 'relevantSymbol' --fn  Find and read the code you need
   3. ctx deps src/target.ts          Understand what it touches
-  4. ctx read src/a.ts src/b.ts      Read related files in one call")]
+  4. ctx flow handleSubmit           Trace how a value flows across files
+  5. ctx read src/a.ts src/b.ts      Read related files in one call")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -193,6 +198,37 @@ pub enum Command {
     ///   ctx deps src/index.ts           Show what index.ts imports
     ///   ctx deps src/api/router.ts      Trace API router dependencies
     Deps(deps::DepsArgs),
+
+    /// Trace how a symbol flows through the codebase.
+    ///
+    /// Finds all references to a symbol, classifies each by role (definition,
+    /// call, prop pass, import, mutation, etc.) using AST analysis, and renders
+    /// them as a narrative flow. Replaces the grep→read→grep→read cycle.
+    ///
+    /// CLASSIFICATION KINDS (in narrative order):
+    ///   IMPORT       — import { symbol } from '...'
+    ///   DEFINITION   — const symbol = ..., function symbol() {}
+    ///   TYPE         — interface/type definitions and type annotations
+    ///   EXPORT       — export { symbol }, export default symbol
+    ///   PROP RECEIVE — function({ symbol }) or (symbol: Type) parameter
+    ///   CALL         — symbol(), <Symbol />, new Symbol()
+    ///   PROP PASS    — <Component symbol={value} />
+    ///   CONDITIONAL  — if (symbol), symbol ? a : b
+    ///   RETURN       — return symbol
+    ///   MUTATION     — symbol = newValue, symbol++
+    ///   READ         — any other reference
+    ///
+    /// WHEN TO USE: Understanding how a value moves through the codebase.
+    /// "Where is this born, transformed, and consumed?"
+    ///
+    /// EXAMPLES:
+    ///   ctx flow fetchUser                         Trace across all files
+    ///   ctx flow hasReceivedMessage --type tsx      Trace in TSX files only
+    ///   ctx flow handleSubmit --no-tests            Skip test files
+    ///   ctx flow UserProfile src/components/        Trace within a directory
+    ///   ctx flow fetchUser --ask 'which handle errors?'
+    ///                                              LLM-filtered flow
+    Flow(flow::FlowArgs),
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -204,5 +240,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Symbols(args) => symbols::run(args, &cli.common),
         Command::Overview(args) => overview::run(args, &cli.common),
         Command::Deps(args) => deps::run(args, &cli.common),
+        Command::Flow(args) => flow::run(args, &cli.common),
     }
 }
