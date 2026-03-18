@@ -6,6 +6,7 @@ pub mod symbols;
 pub mod overview;
 pub mod deps;
 pub mod flow;
+pub mod chain;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -24,6 +25,7 @@ use clap::{Args, Parser, Subcommand};
 ///   Need file contents?        → ctx read file1 file2
 ///   Need a module's API?       → ctx symbols path/
 ///   Need dependency chain?     → ctx deps file
+///   Who imports this file?     → ctx chain file
 ///   How does a value flow?     → ctx flow symbol
 ///   Need directory layout?     → ctx tree path/ -d 3
 ///
@@ -51,6 +53,9 @@ use clap::{Args, Parser, Subcommand};
   ctx deps src/index.ts                        Show import dependency tree
   ctx flow fetchUser                           Trace symbol through codebase
   ctx flow fetchUser --type ts --no-tests      Trace in TS files, skip tests
+  ctx chain src/utils.ts                       Who imports this file? (reverse)
+  ctx chain src/utils.ts --forward             What does this file import?
+  ctx chain src/a.ts src/b.ts                  Find import path from a to b
 
 FLAGS CAN GO ANYWHERE:
   ctx --tokens 500 grep 'pattern'              Before subcommand
@@ -229,6 +234,20 @@ pub enum Command {
     ///   ctx flow fetchUser --ask 'which handle errors?'
     ///                                              LLM-filtered flow
     Flow(flow::FlowArgs),
+
+    /// Trace import chains: who imports a file, or path between files.
+    ///
+    /// Builds a project-wide import graph and traverses it. Default mode
+    /// is reverse: shows all files that (transitively) import the target.
+    ///
+    /// WHEN TO USE: Understanding impact radius, finding all consumers of
+    /// a module, or tracing how file A connects to file B.
+    ///
+    /// EXAMPLES:
+    ///   ctx chain src/utils/auth.ts              Who imports auth.ts?
+    ///   ctx chain src/utils/auth.ts --forward    What does auth.ts import?
+    ///   ctx chain src/utils/auth.ts src/App.tsx  Path from auth.ts to App.tsx
+    Chain(chain::ChainArgs),
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -241,5 +260,6 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Overview(args) => overview::run(args, &cli.common),
         Command::Deps(args) => deps::run(args, &cli.common),
         Command::Flow(args) => flow::run(args, &cli.common),
+        Command::Chain(args) => chain::run(args, &cli.common),
     }
 }
