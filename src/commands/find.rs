@@ -28,7 +28,13 @@ pub struct FindArgs {
 }
 
 pub fn run(args: FindArgs, common: &CommonArgs) -> Result<()> {
-    let glob = Glob::new(&args.pattern)?.compile_matcher();
+    // Auto-wrap bare patterns (no glob chars) for substring matching
+    let pattern_str = if args.pattern.contains(&['*', '?', '[', ']', '{', '}'][..]) {
+        args.pattern.clone()
+    } else {
+        format!("*{}*", args.pattern)
+    };
+    let glob = Glob::new(&pattern_str)?.compile_matcher();
 
     let walker = walker::build_walker(&args.path, !common.no_gitignore).build();
 
@@ -42,12 +48,14 @@ pub fn run(args: FindArgs, common: &CommonArgs) -> Result<()> {
         if path.is_dir() {
             continue;
         }
+        let rel_path = path.strip_prefix(&args.path).unwrap_or(path);
+        let rel_str = rel_path.to_string_lossy();
         let name = match path.file_name() {
             Some(n) => n.to_string_lossy(),
             None => continue,
         };
 
-        if !glob.is_match(name.as_ref()) {
+        if !glob.is_match(rel_str.as_ref()) && !glob.is_match(name.as_ref()) {
             continue;
         }
 
