@@ -1,5 +1,6 @@
 use ignore::WalkBuilder;
 use std::path::Path;
+use std::ffi::OsStr;
 
 /// Standard noise directories excluded from all walks.
 pub const NOISE_DIRS: &[&str] = &[
@@ -28,4 +29,17 @@ pub fn build_walker(path: &Path, git_ignore: bool) -> WalkBuilder {
             !NOISE_DIRS.contains(&name.as_ref())
         });
     builder
+}
+
+/// Check if a file path looks like a test file.
+pub fn is_test_file(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new(""))
+        .to_string_lossy();
+    name.contains(".test.")
+        || name.contains(".spec.")
+        || name.contains("_test.")
+        || name.starts_with("test_")
+        || name.contains(".mocha.")
 }

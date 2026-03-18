@@ -1,5 +1,7 @@
 mod commands;
 mod filter;
+mod output;
+mod resolve;
 mod tokens;
 mod ts;
 mod walker;

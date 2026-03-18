@@ -3,7 +3,6 @@ use clap::Args;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::filter;
 use crate::ts;
 
 use super::CommonArgs;
@@ -68,29 +67,17 @@ pub fn run(args: ReadArgs, common: &CommonArgs) -> Result<()> {
         }
     }
 
-    if common.json {
+    let output = if common.json {
         let json = serde_json::json!({
             "files": args.files.iter().map(|f| f.to_string_lossy().to_string()).collect::<Vec<_>>(),
             "content": output,
         });
-        let output = serde_json::to_string_pretty(&json)?;
-        let output = if let Some(max_tokens) = common.tokens {
-            crate::tokens::truncate_to_tokens(&output, max_tokens)
-        } else {
-            output
-        };
-        let output = filter::maybe_filter(&output, &common.ask)?;
-        print!("{}", output);
+        serde_json::to_string_pretty(&json)?
     } else {
-        let output = if let Some(max_tokens) = common.tokens {
-            crate::tokens::truncate_to_tokens(&output, max_tokens)
-        } else {
-            output
-        };
-        let output = filter::maybe_filter(&output, &common.ask)?;
-        print!("{}", output);
-    }
+        output
+    };
 
+    crate::output::emit(&output, common)?;
     Ok(())
 }
 
