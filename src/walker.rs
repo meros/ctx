@@ -5,6 +5,7 @@ use std::path::Path;
 pub const NOISE_DIRS: &[&str] = &[
     "node_modules",
     ".git",
+    ".yarn",
     "dist",
     "build",
     ".next",
